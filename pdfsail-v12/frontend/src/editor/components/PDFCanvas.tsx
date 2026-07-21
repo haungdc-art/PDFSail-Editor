@@ -16,6 +16,7 @@ import { v4 as uuid } from "uuid";
 import type { RefObject } from "react";
 import type { Block, TextBlock } from "../types";
 import { useEditor } from "../core/EditorProvider";
+import { EditableTextNode } from "../../editor-engine/EditableTextNode";
 
 const navBtn: React.CSSProperties = {
   padding: "4px 10px",
@@ -65,6 +66,11 @@ export function PDFCanvas({
     annoFormat,
     textFormat,
     setBlocks,
+    // Commit 5: segments
+    segments,
+    editingSegmentId,
+    setEditingSegmentId,
+    handleSegmentChange,
   } = useEditor();
 
   const pageBlocks = docBlocks.filter((b) => b.page === page);
@@ -164,8 +170,24 @@ export function PDFCanvas({
 
               {/* 2. Interaction Layer（不缩放，1:1 px，pointer-events: none） */}
               <div style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, transform: "none", pointerEvents: "none" }}>
-                {/* TEXT LAYER — 仅显示预览，双击打开 Portal 编辑 */}
-                {showTextLayer && textItems.length > 0 && (
+                {/* SEGMENTS LAYER — Commit 5: Text Intelligence Layer（标点切割 + 字体保真） */}
+                {showTextLayer && segments.length > 0 && (
+                  segments.map((seg) => (
+                    <EditableTextNode
+                      key={seg.id}
+                      segment={seg}
+                      isSelected={false}
+                      isEditing={editingSegmentId === seg.id}
+                      onSelect={() => setEditingSegmentId(null)}
+                      onStartEdit={(id: string) => setEditingSegmentId(id)}
+                      onChange={handleSegmentChange}
+                      onEndEdit={() => setEditingSegmentId(null)}
+                    />
+                  ))
+                )}
+
+                {/* TEXT LAYER — 仅显示预览，双击打开 Portal 编辑（segments 为空时 fallback） */}
+                {showTextLayer && textItems.length > 0 && segments.length === 0 && (
                   textItems.map((t) => {
                     const existing = docBlocks.find((b): b is TextBlock => b.type === "text" && Math.abs(b.x - t.x) < 3 && Math.abs(b.y - t.y) < 3);
                     const displayText = existing?.text || t.text;

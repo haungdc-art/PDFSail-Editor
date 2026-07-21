@@ -24,6 +24,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Block } from "../types";
 import { CommandHistory, PatchBlocksCommand } from "../core/engine";
+import type { Segment } from "../../editor-engine/types";
 
 export function useSelection() {
   const [docBlocks, setDocBlocks] = useState<Block[]>([]);
@@ -45,6 +46,15 @@ export function useSelection() {
     endX: number;
     endY: number;
   } | null>(null);
+
+  // ── Commit 5: Text Intelligence Layer（segments 替代原 textItems 渲染） ──
+  const [segments, setSegments] = useState<Segment[]>([]);
+  const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
+
+  /** 修改 segment 文本（编辑框 onBlur 时调用） */
+  const handleSegmentChange = useCallback((id: string, newText: string) => {
+    setSegments((prev) => prev.map((s) => (s.id === id ? { ...s, text: newText } : s)));
+  }, []);
 
   // ── CommandHistory（替代 UndoRedo） ──
   // 用 useState lazy init 保证实例稳定 + 类型不含 null（避免 useRef lazy init 的 `current: T | null` 陷阱）
@@ -120,6 +130,9 @@ export function useSelection() {
     selectedBlockId,
     editingBlock,
     ocrSelect,
+    // Commit 5: segments
+    segments,
+    editingSegmentId,
     // setters
     setDocBlocks,
     setTextItems,
@@ -127,6 +140,9 @@ export function useSelection() {
     setSelectedBlockId,
     setEditingBlock,
     setOcrSelect,
+    setSegments,
+    setEditingSegmentId,
+    handleSegmentChange,
     // undo/redo (Commit 4: CommandHistory — instance，不是 ref)
     undoRef,
     history,

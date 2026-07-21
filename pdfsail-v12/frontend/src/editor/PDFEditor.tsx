@@ -13,6 +13,12 @@ import { SidePanel } from "./components/SidePanel";
 import { PDFCanvas } from "./components/PDFCanvas";
 import { DownloadButton } from "./components/DownloadButton";
 import { PostLoadModal } from "./components/PostLoadModal";
+// Commit 5: Text Intelligence Layer
+import { extractGlyphs } from "../editor-engine/TextExtractor";
+import { groupIntoLines, buildSegments } from "../editor-engine/SegmentBuilder";
+import { FontAnalyzerImpl } from "../editor-engine/FontAnalyzer";
+import { CoordinateMapperImpl } from "../editor-engine/CoordinateMapper";
+import type { PdfTextContent } from "../editor-engine/types";
 // Feature hooks (Commit 3)
 import { useOCR } from "./features/useOCR";
 import { usePageOps } from "./features/usePageOps";
@@ -52,6 +58,8 @@ function PDFEditorInner() {
     editingBlock, setEditingBlock,
     ocrSelect, setOcrSelect,
     undoRef, setBlocks, handleUndo, handleRedo, clearHistory,
+    // Commit 5: segments
+    segments, setSegments, editingSegmentId, setEditingSegmentId, handleSegmentChange,
     // tool
     textFormat, setTextFormat,
     highlightFormat, setHighlightFormat,
@@ -131,6 +139,7 @@ function PDFEditorInner() {
       coordRef.current = new LockCoordSystem({ scale: 1.5, width: vp.width, height: vp.height });
 
       // Extract text → CSS display coords (canvas px × cssScale)
+      // 保留原 textItems（OCR/highlight 仍依赖）
       const tc = await pg.getTextContent();
       const s = cssScaleRef.current;
       setTextItems(
@@ -139,6 +148,19 @@ function PDFEditorInner() {
           return { id: crypto.randomUUID(), text: i.str, x: c.x * s, y: c.y * s, w: c.w * s, h: c.h * s, fontSize: c.fontSize * s };
         })
       );
+
+      // Commit 5: Text Intelligence Layer
+      // RawGlyph → LineGroup → Segment（标点切割 + 字体保真）
+      const glyphs = extractGlyphs(tc as unknown as PdfTextContent);
+      const lines = groupIntoLines(glyphs);
+      const mapper = new CoordinateMapperImpl({
+        viewportScale: 1.5,
+        viewportHeight: vp.height / 1.5, // PDF pt height
+        cssScale: s,
+      });
+      const fontAnalyzer = new FontAnalyzerImpl();
+      const segs = buildSegments(lines, mapper, fontAnalyzer);
+      setSegments(segs);
     })();
     return () => { done = true; };
   }, [pdfDoc, page]);
@@ -221,21 +243,34 @@ function PDFEditorInner() {
     setShowPostLoadModal(true);
   };
 
-  // Commit 4+: 检测 URL ?file=URL 参数，自动从远程加载 PDF（支持从 pdfsail.com/en/edit-pdf 跳转）
+  // Commit 4+: 检测 URL ?fileKey= 参数，从 www.pdfsail.com R2 加载 PDF
+  // 流程：用户在 www.pdfsail.com/en/edit-pdf 上传 → 跳转 edit.pdfsail.com?fileKey=xxx
+  // 本项目 fetch https://www.pdfsail.com/api/r2-file?key=editor/results/${fileKey}.pdf
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    const fileUrl = params.get("file");
-    if (!fileUrl) return;
+    const fileKey = params.get("fileKey") || params.get("file");
+    if (!fileKey) return;
     (async () => {
       try {
-        const resp = await fetch(fileUrl);
+        // 如果是完整 URL 直接用；如果是 fileKey token 则拼 R2 路径
+        let fetchUrl: string;
+        let fileName: string;
+        if (fileKey.startsWith("http")) {
+          // 兼容旧的 ?file=URL 参数
+          fetchUrl = fileKey;
+          fileName = fileKey.split("/").pop()?.split("?")[0] || "document.pdf";
+        } else {
+          // fileKey token → R2 key: editor/results/${fileKey}.pdf
+          const r2Key = fileKey.includes("/") ? fileKey : `editor/results/${fileKey}.pdf`;
+          fetchUrl = `https://www.pdfsail.com/api/r2-file?key=${encodeURIComponent(r2Key)}`;
+          fileName = `${fileKey}.pdf`;
+        }
+        const resp = await fetch(fetchUrl);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const buf = await resp.arrayBuffer();
-        // 从 URL 推断文件名
-        const name = fileUrl.split("/").pop()?.split("?")[0] || "document.pdf";
-        await loadPdfFromArrayBuffer(buf, name);
+        await loadPdfFromArrayBuffer(buf, fileName);
       } catch (err) {
-        console.error("Failed to load PDF from URL:", err);
+        console.error("Failed to load PDF from R2:", err);
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps

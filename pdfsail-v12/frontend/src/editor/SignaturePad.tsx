@@ -12,6 +12,8 @@ export default function SignaturePad({
   const [artColor, setArtColor] = useState("#1e293b");
   const [artFont, setArtFont] = useState("'Dancing Script', cursive");
   const [photoData, setPhotoData] = useState("");
+  const [fontPage, setFontPage] = useState(0);
+  const FONTS_PER_PAGE = 5;
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const artCanvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -151,14 +153,39 @@ export default function SignaturePad({
             </div>
 
             <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>Style</label>
-            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 12 }}>
-              {fonts.map((f) => (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
+              {fonts.slice(fontPage * FONTS_PER_PAGE, (fontPage + 1) * FONTS_PER_PAGE).map((f) => (
                 <button key={f.value} onClick={() => setArtFont(f.value)} style={{ display: "flex", alignItems: "center", gap: 8, padding: 10, borderRadius: 6, border: artFont === f.value ? "2px solid #3b82f6" : "1px solid #e2e8f0", background: artFont === f.value ? "#eff6ff" : "#fff", cursor: "pointer" }}>
                   <div style={{ width: 16, height: 16, borderRadius: 8, border: "2px solid #3b82f6", background: artFont === f.value ? "#3b82f6" : "transparent" }} />
                   <span style={{ fontFamily: f.value, fontSize: 24, color: artColor }}>Signature</span>
                 </button>
               ))}
             </div>
+            {(() => {
+              const totalPages = Math.ceil(fonts.length / FONTS_PER_PAGE);
+              if (totalPages <= 1) return null;
+              return (
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 12 }}>
+                  <button
+                    onClick={() => setFontPage((p) => Math.max(0, p - 1))}
+                    disabled={fontPage === 0}
+                    style={{ padding: "4px 10px", borderRadius: 4, border: "1px solid #e2e8f0", background: fontPage === 0 ? "#f8fafc" : "#fff", color: fontPage === 0 ? "#cbd5e1" : "#1e293b", cursor: fontPage === 0 ? "not-allowed" : "pointer", fontSize: 12 }}
+                  >
+                    ← Prev
+                  </button>
+                  <span style={{ fontSize: 12, color: "#64748b", minWidth: 40, textAlign: "center" }}>
+                    {fontPage + 1} / {totalPages}
+                  </span>
+                  <button
+                    onClick={() => setFontPage((p) => Math.min(totalPages - 1, p + 1))}
+                    disabled={fontPage === totalPages - 1}
+                    style={{ padding: "4px 10px", borderRadius: 4, border: "1px solid #e2e8f0", background: fontPage === totalPages - 1 ? "#f8fafc" : "#fff", color: fontPage === totalPages - 1 ? "#cbd5e1" : "#1e293b", cursor: fontPage === totalPages - 1 ? "not-allowed" : "pointer", fontSize: 12 }}
+                  >
+                    Next →
+                  </button>
+                </div>
+              );
+            })()}
 
             <canvas ref={artCanvasRef} width={440} height={80} style={{ border: "1px solid #e2e8f0", borderRadius: 8, width: "100%", background: "#fff" }} />
           </>

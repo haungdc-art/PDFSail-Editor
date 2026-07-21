@@ -4,14 +4,15 @@
  * 页面顶部右上角的 Download 入口：
  *   1. 点击后显示全屏进度条 overlay
  *   2. 调用 handleExport 生成 PDF（不本地下载，拿 blob）
- *   3. 生成 fileKey，上传到 ai.pdfsail.com/api/r2-store（Cloudflare R2）
- *   4. 跳转到 https://www.pdfsail.com/[locale]/ready?key=...&r2=...&r2host=...
+ *   3. 生成 fileKey，上传到 www.pdfsail.com/api/r2-store（Cloudflare R2）
+ *   4. 跳转到 https://www.pdfsail.com/[locale]/ready?key=editor/results/xxx.pdf&...
  *   5. 上传失败时 fallback 本地下载
  *
  * 跨域说明：
- *   - ai.pdfsail.com/api/r2-store 需配置 CORS 允许本项目域名
- *   - ready 页面通过 r2host 参数从 ai.pdfsail.com/api/r2-file 拉取
- *   - 参考 pdfsail.com 的 fileKey 方案（双重上传到 ai + www R2）
+ *   - www.pdfsail.com/api/r2-store 已配置 CORS: Access-Control-Allow-Origin: *
+ *   - body 是 raw stream（不是 FormData），URL 参数带 token/tool/ext
+ *   - R2 key 格式：editor/results/${token}.pdf
+ *   - worker.js 参考：D:\TRAE\NewPDFSail\worker.js L2194-2214
  */
 
 import { useState } from "react";
@@ -26,8 +27,8 @@ interface DownloadButtonProps {
 
 type Phase = "idle" | "preparing" | "uploading" | "redirecting" | "done" | "error";
 
-const R2_STORE_URL = "https://ai.pdfsail.com/api/r2-store";
-const R2_FILE_HOST = "https://ai.pdfsail.com/api/r2-file";
+const R2_STORE_URL = "https://www.pdfsail.com/api/r2-store";
+const R2_FILE_HOST = "https://www.pdfsail.com/api/r2-file";
 const READY_BASE = "https://www.pdfsail.com";
 
 export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) {
@@ -51,6 +52,12 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     const ts = Date.now();
     const rand = Math.random().toString(36).slice(2, 10);
     return `editor_${ts}_${rand}`;
+  };
+
+  // 从当前页面 URL 读取原始 fileKey（如果是从 pdfsail.com 跳转来的），用于回传时复用
+  const getOriginalFileKey = (): string | null => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get("fileKey");
   };
 
   const start = async () => {
@@ -77,19 +84,20 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
 
     setProgress(25);
 
-    // 阶段 2：上传到 R2
+    // 阶段 2：上传到 R2（www.pdfsail.com/api/r2-store，raw body + URL 参数）
     setPhase("uploading");
-    const fileKey = generateFileKey();
+    const token = generateFileKey();
     let uploaded = false;
     try {
-      const formData = new FormData();
-      formData.append("file", result.blob, result.fileName);
-      formData.append("key", fileKey);
-
-      const upResp = await fetch(R2_STORE_URL, {
-        method: "POST",
-        body: formData,
-      });
+      // worker.js L2194-2214：URL 参数带 token/tool/ext，body 是 raw stream
+      const upResp = await fetch(
+        `${R2_STORE_URL}?token=${encodeURIComponent(token)}&tool=editor&ext=pdf`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/pdf" },
+          body: result.blob,
+        }
+      );
       if (upResp.ok) {
         uploaded = true;
       } else {
@@ -133,9 +141,11 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     }
 
     const locale = lang === "pt" ? "pt" : "en";
+    // R2 key 格式：editor/results/${token}.pdf（匹配 worker.js L2201）
+    const r2Key = `editor/results/${token}.pdf`;
     const params = new URLSearchParams({
-      key: fileKey,
-      r2: fileKey,
+      key: r2Key,
+      r2: r2Key,
       tool: "editor",
       task: "edit",
       name: result.fileName,
