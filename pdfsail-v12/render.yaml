@@ -1,0 +1,33 @@
+# Render 部署配置 — PDFSail V12/V13
+#
+# 部署方式：单个 Web Service（后端 Express serve 前端静态文件）
+#
+# 使用方法：
+#   1. 在 Render 控制台创建新 Web Service，连接此 repo
+#   2. Render 会自动读取此 render.yaml
+#   3. 设置环境变量 STRIPE_KEY / PAYPAL_CLIENT_ID / PAYPAL_SECRET（可选，缺失则 mock 模式）
+#
+# 部署后 URL 示例：https://pdfsail-v12.onrender.com
+# 前端 + 后端同域，/api/* 走后端路由，其他走 SPA fallback
+
+services:
+  - type: web
+    name: pdfsail-v12
+    runtime: node
+    plan: free
+    buildCommand: npm install && npm run build
+    startCommand: npm run server
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        # 部署后改为实际 Render 域名，如 https://pdfsail-v12.onrender.com
+        value: "*"
+      - key: STRIPE_KEY
+        sync: false  # 在 Render 控制台手动设置
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_SECRET
+        sync: false

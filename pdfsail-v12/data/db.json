@@ -1,0 +1,115 @@
+{
+  "value_events": [
+    {
+      "id": "62f6ccc6-1650-4f93-87be-9122ad425ce3_upload_1783171802102_902d",
+      "doc_id": "62f6ccc6-1650-4f93-87be-9122ad425ce3",
+      "event": "upload",
+      "timestamp": 1783171802102,
+      "metadata": {
+        "pageCount": 1,
+        "size": 55071
+      }
+    },
+    {
+      "id": "62f6ccc6-1650-4f93-87be-9122ad425ce3_analyze_1783171803321_1nmz",
+      "doc_id": "62f6ccc6-1650-4f93-87be-9122ad425ce3",
+      "event": "analyze",
+      "timestamp": 1783171803321,
+      "metadata": {
+        "valueFlag": "UNCERTAIN",
+        "score": 3,
+        "signals": [
+          "financial_document"
+        ]
+      }
+    },
+    {
+      "id": "d28558cc-d3dd-402a-b7f2-92eb07d56415_upload_1783171982029_3l21",
+      "doc_id": "d28558cc-d3dd-402a-b7f2-92eb07d56415",
+      "event": "upload",
+      "timestamp": 1783171982029,
+      "metadata": {
+        "pageCount": 3,
+        "size": 4030126
+      }
+    },
+    {
+      "id": "d28558cc-d3dd-402a-b7f2-92eb07d56415_analyze_1783171982248_uqei",
+      "doc_id": "d28558cc-d3dd-402a-b7f2-92eb07d56415",
+      "event": "analyze",
+      "timestamp": 1783171982248,
+      "metadata": {
+        "valueFlag": "UNCERTAIN",
+        "score": 4,
+        "signals": [
+          "table_like_structure",
+          "rich_text"
+        ]
+      }
+    },
+    {
+      "id": "78583a68-2014-44e7-a07c-e0aa65e2083d_upload_1783172003439_uyb5",
+      "doc_id": "78583a68-2014-44e7-a07c-e0aa65e2083d",
+      "event": "upload",
+      "timestamp": 1783172003439,
+      "metadata": {
+        "pageCount": 1,
+        "size": 13781
+      }
+    },
+    {
+      "id": "78583a68-2014-44e7-a07c-e0aa65e2083d_analyze_1783172003460_d8cc",
+      "doc_id": "78583a68-2014-44e7-a07c-e0aa65e2083d",
+      "event": "analyze",
+      "timestamp": 1783172003461,
+      "metadata": {
+        "valueFlag": "UNCERTAIN",
+        "score": 3,
+        "signals": [
+          "financial_document"
+        ]
+      }
+    },
+    {
+      "id": "d2fa7060-1017-407d-8e75-2a104a5a2b14_upload_1783210986273_ig0o",
+      "doc_id": "d2fa7060-1017-407d-8e75-2a104a5a2b14",
+      "event": "upload",
+      "timestamp": 1783210986273,
+      "metadata": {
+        "pageCount": 1,
+        "size": 13781
+      }
+    },
+    {
+      "id": "d2fa7060-1017-407d-8e75-2a104a5a2b14_upload_1783210986533_n5yb",
+      "doc_id": "d2fa7060-1017-407d-8e75-2a104a5a2b14",
+      "event": "upload",
+      "timestamp": 1783210986533,
+      "metadata": {
+        "variant": "B"
+      }
+    },
+    {
+      "id": "d2fa7060-1017-407d-8e75-2a104a5a2b14_analyze_1783210986995_t23g",
+      "doc_id": "d2fa7060-1017-407d-8e75-2a104a5a2b14",
+      "event": "analyze",
+      "timestamp": 1783210986995,
+      "metadata": {
+        "valueFlag": "UNCERTAIN",
+        "score": 3,
+        "signals": [
+          "financial_document"
+        ]
+      }
+    },
+    {
+      "id": "d2fa7060-1017-407d-8e75-2a104a5a2b14_analyze_1783210987001_ygqq",
+      "doc_id": "d2fa7060-1017-407d-8e75-2a104a5a2b14",
+      "event": "analyze",
+      "timestamp": 1783210987001,
+      "metadata": {
+        "variant": "B"
+      }
+    }
+  ]
+}

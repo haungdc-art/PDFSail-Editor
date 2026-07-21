@@ -1,0 +1,322 @@
+.value-probe-container {
+  max-width: 640px;
+  margin: 60px auto;
+  padding: 0 24px;
+  min-height: 400px;
+}
+
+/* ── Upload Box ── */
+
+.upload-zone {
+  border: 2px dashed #444;
+  border-radius: 16px;
+  padding: 60px 40px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  background: #1a1a2e;
+}
+
+.upload-zone:hover {
+  border-color: #7c5cfc;
+  background: #1e1e3a;
+}
+
+.upload-zone.dragging {
+  border-color: #7c5cfc;
+  background: #2a2050;
+}
+
+.upload-zone h2 {
+  color: #e0e0e0;
+  font-size: 20px;
+  margin: 0 0 8px;
+}
+
+.upload-zone p {
+  color: #888;
+  font-size: 14px;
+  margin: 0;
+}
+
+.upload-zone .upload-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+  display: block;
+}
+
+/* ── Loading ── */
+
+.analyzing-state {
+  text-align: center;
+  padding: 80px 40px;
+}
+
+.analyzing-spinner {
+  width: 48px;
+  height: 48px;
+  border: 3px solid #333;
+  border-top-color: #7c5cfc;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+  margin: 0 auto 24px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.analyzing-state h2 {
+  color: #e0e0e0;
+  font-size: 18px;
+  margin: 0 0 8px;
+}
+
+.analyzing-state p {
+  color: #888;
+  font-size: 14px;
+  margin: 0;
+}
+
+/* ── Result Card ── */
+
+.result-card {
+  background: #1a1a2e;
+  border-radius: 16px;
+  padding: 32px;
+}
+
+.result-card .badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
+.badge-yes { background: #1a3a2e; color: #4ade80; }
+.badge-no { background: #3a1a1a; color: #f87171; }
+.badge-uncertain { background: #2a2a1a; color: #facc15; }
+
+.result-card .score-bar {
+  margin: 20px 0;
+}
+
+.score-bar-track {
+  height: 6px;
+  background: #333;
+  border-radius: 3px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+
+.score-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.6s ease;
+  background: linear-gradient(90deg, #7c5cfc, #4ade80);
+}
+
+.score-label {
+  color: #888;
+  font-size: 13px;
+}
+
+.score-value {
+  color: #e0e0e0;
+  font-weight: 700;
+}
+
+/* ── Signals ── */
+
+.signals-list {
+  list-style: none;
+  padding: 0;
+  margin: 16px 0;
+}
+
+.signals-list li {
+  color: #b0b0b0;
+  font-size: 14px;
+  padding: 6px 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.signals-list li::before {
+  content: "✔";
+  color: #4ade80;
+  font-size: 12px;
+}
+
+/* ── CTA ── */
+
+.cta-button {
+  display: block;
+  width: 100%;
+  padding: 16px;
+  border: none;
+  border-radius: 12px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: transform 0.15s, box-shadow 0.15s;
+  background: linear-gradient(135deg, #7c5cfc, #9f7aea);
+  color: #fff;
+  margin-top: 24px;
+}
+
+.cta-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 24px rgba(124, 92, 252, 0.35);
+}
+
+.cta-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.secondary-button {
+  display: block;
+  width: 100%;
+  padding: 14px;
+  border: 1px solid #444;
+  border-radius: 12px;
+  font-size: 15px;
+  cursor: pointer;
+  transition: border-color 0.2s;
+  background: transparent;
+  color: #ccc;
+  margin-top: 12px;
+}
+
+.secondary-button:hover {
+  border-color: #7c5cfc;
+  color: #fff;
+}
+
+/* ── Action Panel ── */
+
+.action-card {
+  background: #1a1a2e;
+  border-radius: 16px;
+  padding: 32px;
+}
+
+.action-card .action-title {
+  color: #7c5cfc;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin: 0 0 12px;
+}
+
+.action-card h2 {
+  color: #e0e0e0;
+  font-size: 20px;
+  margin: 0 0 8px;
+}
+
+.action-card .action-reason {
+  color: #888;
+  font-size: 14px;
+  margin: 0 0 24px;
+  line-height: 1.5;
+}
+
+/* ── Result Preview ── */
+
+.preview-box {
+  background: #0d0d1a;
+  border-radius: 10px;
+  padding: 16px;
+  margin-top: 24px;
+  font-size: 13px;
+  color: #b0b0b0;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  font-family: "Courier New", monospace;
+  line-height: 1.4;
+}
+
+/* ── Value Badge ── */
+
+.value-created-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 20px;
+}
+
+.value-created-badge.success {
+  background: #1a3a2e;
+  color: #4ade80;
+}
+
+.value-created-badge.fail {
+  background: #3a1a1a;
+  color: #f87171;
+}
+
+/* ── Upload form ── */
+
+.upload-form {
+  margin-bottom: 24px;
+}
+
+.upload-form h1 {
+  color: #e0e0e0;
+  font-size: 24px;
+  margin: 0 0 8px;
+}
+
+.upload-form p {
+  color: #888;
+  font-size: 14px;
+  margin: 0 0 24px;
+}
+
+/* ── Nav back ── */
+
+.back-link {
+  color: #888;
+  font-size: 13px;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 24px;
+}
+
+.back-link:hover {
+  color: #7c5cfc;
+}
+
+/* ── Error state ── */
+
+.error-state {
+  text-align: center;
+  padding: 60px 40px;
+}
+
+.error-state h2 {
+  color: #f87171;
+  font-size: 18px;
+  margin: 0 0 8px;
+}
+
+.error-state p {
+  color: #888;
+  font-size: 14px;
+  margin: 0 0 24px;
+}
