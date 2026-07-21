@@ -16,6 +16,31 @@
 import React, { useRef, useState, useEffect } from "react";
 import type { Segment } from "./types";
 
+/**
+ * 根据屏幕坐标获取光标位置 Range。
+ * - Chrome/Safari: document.caretRangeFromPoint(x, y) → Range
+ * - Firefox: document.caretPositionFromPoint(x, y) → CaretPosition（需转换为 Range）
+ * - 失败返回 null
+ */
+function getCaretRangeFromPoint(x: number, y: number): Range | null {
+  // Chrome/Safari
+  if (typeof document.caretRangeFromPoint === "function") {
+    return document.caretRangeFromPoint(x, y);
+  }
+  // Firefox
+  const docAny = document as any;
+  if (typeof docAny.caretPositionFromPoint === "function") {
+    const pos = docAny.caretPositionFromPoint(x, y);
+    if (pos && pos.offsetNode) {
+      const range = document.createRange();
+      range.setStart(pos.offsetNode, pos.offset);
+      range.collapse(true);
+      return range;
+    }
+  }
+  return null;
+}
+
 interface EditableTextNodeProps {
   segment: Segment;
   isSelected: boolean;
@@ -38,19 +63,39 @@ export function EditableTextNode({
   const ref = useRef<HTMLDivElement>(null);
   const [localText, setLocalText] = useState(segment.text);
   const [isHovering, setIsHovering] = useState(false);
+  // 记录双击坐标，用于进入编辑模式时定位光标到双击位置（而非选中全部或跑到最左）
+  const doubleClickPosRef = useRef<{ x: number; y: number } | null>(null);
 
   // 同步外部 segment.text 变化（如 undo/redo）
   useEffect(() => {
     if (!isEditing) setLocalText(segment.text);
   }, [segment.text, isEditing]);
 
-  // 进入编辑模式时聚焦
+  // 进入编辑模式时聚焦 + 定位光标到双击位置
   useEffect(() => {
-    if (isEditing && ref.current) {
-      ref.current.focus();
-      // 选中全部内容
+    if (!isEditing || !ref.current) return;
+    ref.current.focus();
+
+    const pos = doubleClickPosRef.current;
+    doubleClickPosRef.current = null;
+
+    // 优先用 caretRangeFromPoint 定位光标到双击位置（符合用户"双击哪里编辑哪里"的直觉）
+    let caretPlaced = false;
+    if (pos) {
+      const range = getCaretRangeFromPoint(pos.x, pos.y);
+      if (range && ref.current.contains(range.startContainer)) {
+        const sel = window.getSelection();
+        sel?.removeAllRanges();
+        sel?.addRange(range);
+        caretPlaced = true;
+      }
+    }
+
+    // Fallback：光标放在文本末尾（不选中全部，避免光标跑到最左）
+    if (!caretPlaced && ref.current.firstChild) {
       const range = document.createRange();
       range.selectNodeContents(ref.current);
+      range.collapse(false); // false = 末尾
       const sel = window.getSelection();
       sel?.removeAllRanges();
       sel?.addRange(range);
@@ -146,6 +191,8 @@ export function EditableTextNode({
       }}
       onDoubleClick={(e) => {
         e.stopPropagation();
+        // 记录双击坐标，用于进入编辑模式后定位光标到双击位置
+        doubleClickPosRef.current = { x: e.clientX, y: e.clientY };
         onStartEdit(segment.id);
       }}
       onMouseEnter={() => {
