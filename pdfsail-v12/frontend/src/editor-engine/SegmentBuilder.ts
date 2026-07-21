@@ -127,6 +127,8 @@ function mergeLine(glyphs: RawGlyph[]): LineGroup {
 /**
  * 把 LineGroup[] 按标点切割成 Segment[]。
  *
+ * 切割策略：按 glyph 实际坐标切割（非估算宽度），确保每个 segment 的 cssX/cssW 精确对应 PDF 中的文本位置。
+ *
  * @param lines 行数组
  * @param mapper 坐标映射器（PDF pt → CSS px）
  * @param fontAnalyzer 字体分析器（生成 FontMeta）
@@ -143,33 +145,20 @@ export function buildSegments(
     const isTable = detectTableLine(line);
     if (isTable) {
       // 表格行不切割，整行作为一个 segment
-      segments.push(buildSegment(line.text, line, mapper, fontAnalyzer, true));
+      segments.push(buildSegmentFromGlyphs(line.glyphs, line, mapper, fontAnalyzer, true));
       continue;
     }
 
-    // 按标点切割
-    const parts = splitByPunctuation(line.text);
-    if (parts.length <= 1) {
+    // 按标点切割 glyph 数组（用实际坐标，非估算宽度）
+    const glyphGroups = splitGlyphsByPunctuation(line.glyphs);
+    if (glyphGroups.length <= 1) {
       // 无标点：整行一个 segment
-      segments.push(buildSegment(line.text, line, mapper, fontAnalyzer, false));
+      segments.push(buildSegmentFromGlyphs(line.glyphs, line, mapper, fontAnalyzer, false));
     } else {
-      // 有标点：每个 part 一个 segment
-      // 注意：切割后坐标需要按文本宽度比例分配
-      let xOffset = 0;
-      for (const part of parts) {
-        if (!part) continue;
-        const partWidth = estimateTextWidth(part, line.fontSize);
-        const segment = buildSegmentWithOffset(
-          part,
-          line,
-          xOffset,
-          partWidth,
-          mapper,
-          fontAnalyzer,
-          false
-        );
-        segments.push(segment);
-        xOffset += partWidth;
+      // 有标点：每个 glyph group 一个 segment，坐标从 glyph 实际位置计算
+      for (const glyphs of glyphGroups) {
+        if (glyphs.length === 0) continue;
+        segments.push(buildSegmentFromGlyphs(glyphs, line, mapper, fontAnalyzer, false));
       }
     }
   }
@@ -177,25 +166,34 @@ export function buildSegments(
   return segments;
 }
 
-/** 按标点切割（保留标点） */
-function splitByPunctuation(text: string): string[] {
-  // 用正则切割，保留分隔符
-  return text.split(PUNCT_REGEX).reduce<string[]>((acc, part, i) => {
-    if (i === 0) {
-      acc.push(part);
-    } else if (i % 2 === 1) {
-      // 标点：附加到前一个 part
-      if (acc.length > 0) {
-        acc[acc.length - 1] += part;
-      } else {
-        acc.push(part);
-      }
-    } else {
-      // 标点后的文本：新 part
-      acc.push(part);
+/**
+ * 按标点切割 glyph 数组（保留标点在前一段）。
+ *
+ * 与 splitByPunctuation 不同，本函数按 glyph 粒度切割，
+ * 每个 glyph group 的坐标直接从 glyph 实际 pdfX/width 计算，确保 cssX/cssW 精确。
+ *
+ * 切割规则：
+ *   - 遍历每个 glyph，累积到 currentGroup
+ *   - 检查 glyph.str 的最后一个字符是否是标点（。！？；：.!?;:）
+ *   - 如果是标点，把 currentGroup 作为一个 group 输出，开始新的 group
+ *   - 遍历结束后，剩余的 currentGroup 作为最后一个 group
+ */
+function splitGlyphsByPunctuation(glyphs: RawGlyph[]): RawGlyph[][] {
+  if (glyphs.length === 0) return [];
+  const groups: RawGlyph[][] = [];
+  let currentGroup: RawGlyph[] = [];
+
+  for (const g of glyphs) {
+    currentGroup.push(g);
+    // 检查 glyph.str 末尾是否是标点
+    const lastChar = g.str[g.str.length - 1];
+    if (PUNCT_REGEX.test(lastChar)) {
+      groups.push(currentGroup);
+      currentGroup = [];
     }
-    return acc;
-  }, []);
+  }
+  if (currentGroup.length > 0) groups.push(currentGroup);
+  return groups;
 }
 
 /** 检测表格行（启发式：glyph x 间距等距且数量多） */
@@ -216,86 +214,52 @@ function detectTableLine(line: LineGroup): boolean {
   return stdDev < avg * 0.3; // 间距稳定才算表格
 }
 
-/** 构建一个 segment（整行） */
-function buildSegment(
-  text: string,
+/**
+ * 从一组 glyph 构建 segment（坐标从 glyph 实际位置计算）。
+ *
+ * @param glyphs 同一 segment 的 glyph 数组（已是行内子集）
+ * @param line 所属行（用于 fontName/fontSize/lineId）
+ * @param mapper 坐标映射器
+ * @param fontAnalyzer 字体分析器
+ * @param isTableCell 是否表格 cell
+ */
+function buildSegmentFromGlyphs(
+  glyphs: RawGlyph[],
   line: LineGroup,
   mapper: CoordinateMapper,
   fontAnalyzer: FontAnalyzer,
   isTableCell: boolean
 ): Segment {
-  const css = mapper.pdfToCss(line.pdfX, line.pdfY, line.width, line.height);
+  const text = glyphs.map((g) => g.str).join("");
+  // pdfX = 第一个 glyph 的 pdfX；pdfW = 最后一个 glyph 右边缘 - 第一个 glyph 左边缘
+  const firstG = glyphs[0];
+  const lastG = glyphs[glyphs.length - 1];
+  const pdfX = firstG.pdfX;
+  const pdfW = lastG.pdfX + lastG.width - firstG.pdfX;
+  const pdfY = line.pdfY;
+  const pdfH = line.height;
+
+  const css = mapper.pdfToCss(pdfX, pdfY, pdfW, pdfH);
   const font = fontAnalyzer.analyze(line.fontName, line.fontSize);
-  // 应用 viewportScale × cssScale，与原 textItems fontSize 一致（避免字体大小不匹配产生重影）
+  // 应用 viewportScale × cssScale，与原 textItems fontSize 一致
   font.size = mapper.scaleFontSize(line.fontSize);
-  // 行高动态计算：让文字行高 = 编辑框高度，避免文字溢出编辑框
-  // （cssH = maxFontSize × scale = font.size，所以 lineHeight = 1.0；但保留除法以防 font.size 与 cssH 微小差异）
+  // 行高动态计算：让文字行高 = 编辑框高度，避免文字溢出
   font.lineHeight = font.size > 0 ? css.h / font.size : 1.0;
+
   return {
-    id: `seg_${line.pdfX.toFixed(0)}_${line.pdfY.toFixed(0)}_${Math.random().toString(36).slice(2, 6)}`,
+    id: `seg_${pdfX.toFixed(0)}_${pdfY.toFixed(0)}_${Math.random().toString(36).slice(2, 6)}`,
     text,
     originalText: text,
-    pdfX: line.pdfX,
-    pdfY: line.pdfY,
-    pdfW: line.width,
-    pdfH: line.height,
+    pdfX,
+    pdfY,
+    pdfW,
+    pdfH,
     cssX: css.x,
     cssY: css.y,
     cssW: css.w,
     cssH: css.h,
     font,
-    lineId: `line_${line.pdfY.toFixed(0)}`,
+    lineId: `line_${pdfY.toFixed(0)}`,
     isTableCell,
   };
-}
-
-/** 构建带 x 偏移的 segment（切割后的片段） */
-function buildSegmentWithOffset(
-  text: string,
-  line: LineGroup,
-  xOffset: number,
-  partWidth: number,
-  mapper: CoordinateMapper,
-  fontAnalyzer: FontAnalyzer,
-  isTableCell: boolean
-): Segment {
-  const css = mapper.pdfToCss(line.pdfX + xOffset, line.pdfY, partWidth, line.height);
-  const font = fontAnalyzer.analyze(line.fontName, line.fontSize);
-  font.size = mapper.scaleFontSize(line.fontSize);
-  font.lineHeight = font.size > 0 ? css.h / font.size : 1.0;
-  return {
-    id: `seg_${(line.pdfX + xOffset).toFixed(0)}_${line.pdfY.toFixed(0)}_${xOffset.toFixed(0)}_${Math.random().toString(36).slice(2, 6)}`,
-    text,
-    originalText: text,
-    pdfX: line.pdfX + xOffset,
-    pdfY: line.pdfY,
-    pdfW: partWidth,
-    pdfH: line.height,
-    cssX: css.x,
-    cssY: css.y,
-    cssW: css.w,
-    cssH: css.h,
-    font,
-    lineId: `line_${line.pdfY.toFixed(0)}`,
-    isTableCell,
-  };
-}
-
-/** 估算文本宽度（pt，简单实现） */
-function estimateTextWidth(text: string, fontSize: number): number {
-  let w = 0;
-  for (const ch of text) {
-    const code = ch.codePointAt(0) || 0;
-    if (
-      (code >= 0x4e00 && code <= 0x9fff) ||
-      (code >= 0x3040 && code <= 0x309f) ||
-      (code >= 0x30a0 && code <= 0x30ff) ||
-      (code >= 0xff00 && code <= 0xffef)
-    ) {
-      w += fontSize; // CJK 全角
-    } else {
-      w += fontSize * 0.55; // 西文半角
-    }
-  }
-  return w;
 }

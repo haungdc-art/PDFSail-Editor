@@ -141,14 +141,16 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     }
 
     const locale = lang === "pt" ? "pt" : "en";
-    // R2 key 格式：editor/results/${token}.pdf（匹配 worker.js L2201）
-    const r2Key = `editor/results/${token}.pdf`;
+    // Ready 页面会把 key/r2 当作纯 token 重新拼接成 `editor/results/${key}.pdf`
+    // 所以这里必须传纯 token（不含 editor/results/ 前缀和 .pdf 后缀），避免双重拼接
+    // 同理 name 也不能带 .pdf 后缀（Ready 页面会拼接 .pdf）
+    const stripPdfExt = (s: string) => s.toLowerCase().endsWith(".pdf") ? s.slice(0, -4) : s;
     const params = new URLSearchParams({
-      key: r2Key,
-      r2: r2Key,
+      key: token,
+      r2: token,
       tool: "editor",
       task: "edit",
-      name: result.fileName,
+      name: stripPdfExt(result.fileName),
       size: String(result.blob.size),
       r2host: R2_FILE_HOST,
     });
