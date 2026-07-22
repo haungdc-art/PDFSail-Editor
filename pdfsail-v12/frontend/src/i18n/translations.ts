@@ -14,6 +14,8 @@ export const translations = {
     // 顶部 Header
     "app.title": "PDFSail Editor",
     "app.header": "📄 PDFSail Editor",
+    "canvas.uploadPdf": "Upload PDF File",
+    "canvas.uploadHint": "Drag & drop or click to upload",
     // 顶部导航
     "nav.editor": "Editor",
     // 页脚
@@ -161,6 +163,8 @@ export const translations = {
     // 顶部 Header
     "app.title": "Editor PDFSail",
     "app.header": "📄 Editor PDFSail",
+    "canvas.uploadPdf": "Enviar Arquivo PDF",
+    "canvas.uploadHint": "Arraste e solte ou clique para enviar",
     // 顶部导航
     "nav.editor": "Editor",
     // 页脚

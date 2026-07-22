@@ -13,9 +13,11 @@
 
 import { createPortal } from "react-dom";
 import { v4 as uuid } from "uuid";
+import { useRef } from "react";
 import type { RefObject } from "react";
 import type { Block, TextBlock } from "../types";
 import { useEditor } from "../core/EditorProvider";
+import { useI18n } from "../../i18n/I18nProvider";
 import { EditableTextNode } from "../../editor-engine/EditableTextNode";
 
 const navBtn: React.CSSProperties = {
@@ -35,6 +37,7 @@ interface PDFCanvasProps {
   resizeRef: React.MutableRefObject<{ id: string; startX: number; startY: number; initW: number; initH: number } | null>;
   addBlock: (type: Block["type"], extra?: any) => void;
   handleOCRRegion: (x: number, y: number, w: number, h: number) => void;
+  handleUpload: (e: React.ChangeEvent<HTMLInputElement>) => void;
 }
 
 export function PDFCanvas({
@@ -44,7 +47,10 @@ export function PDFCanvas({
   resizeRef,
   addBlock,
   handleOCRRegion,
+  handleUpload,
 }: PDFCanvasProps) {
+  const { t } = useI18n();
+  const emptyFileInputRef = useRef<HTMLInputElement>(null);
   const {
     pdfDoc,
     page,
@@ -378,9 +384,32 @@ export function PDFCanvas({
               <div id="edit-portal-root" />
             </>
           ) : (
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#94a3b8", fontSize: 16, flexDirection: "column", gap: 8 }}>
-              <div style={{ fontSize: 40, opacity: 0.3 }}>📄</div>
-              <div>Upload a PDF to start editing</div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100%", color: "#94a3b8", fontSize: 16, flexDirection: "column", gap: 16 }}>
+              <div style={{ fontSize: 48, opacity: 0.3 }}>📄</div>
+              <div style={{ color: "#64748b", fontSize: 15 }}>{t("canvas.uploadHint")}</div>
+              <input
+                ref={emptyFileInputRef}
+                type="file"
+                accept=".pdf"
+                onChange={handleUpload}
+                style={{ display: "none" }}
+              />
+              <button
+                onClick={() => emptyFileInputRef.current?.click()}
+                style={{
+                  padding: "12px 32px",
+                  background: "linear-gradient(135deg,#3b82f6,#2563eb)",
+                  color: "#fff",
+                  border: "none",
+                  borderRadius: 8,
+                  fontSize: 16,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  boxShadow: "0 4px 12px rgba(59,130,246,0.3)",
+                }}
+              >
+                📤 {t("canvas.uploadPdf")}
+              </button>
             </div>
           )}
 

@@ -353,6 +353,7 @@ function PDFEditorInner() {
           resizeRef={resizeRef}
           addBlock={addBlock}
           handleOCRRegion={handleOCRRegion}
+          handleUpload={handleUpload}
         />
       </div>
 
