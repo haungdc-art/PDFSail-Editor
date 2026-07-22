@@ -13,8 +13,9 @@
 
 import { useCallback } from "react";
 import { useEditor } from "../core/EditorProvider";
-import { exportPDF, downloadPDF } from "../export-pdf";
+import { exportPDF } from "../export-pdf";
 import type { LockCoordSystem } from "../coord";
+import { uploadToR2AndRedirect } from "../utils/r2Redirect";
 // Inline tool imports
 import { compressPDF } from "../../compress/compress-core";
 import { splitPDF } from "../../split/split-core";
@@ -24,6 +25,7 @@ import { convertPdfToDocx } from "../../pdftoword/pdftoword-core";
 import { convertPdfToExcel } from "../../pdftoexcel/pdftoexcel-core";
 import { removeWatermark } from "../../watermark/watermark-core";
 import { convertPdfToJpg } from "../../pdftojpg/pdftojpg-core";
+import { PDFDocument } from "pdf-lib";
 
 interface UseInlineToolsParams {
   pdfBytesRef: React.MutableRefObject<ArrayBuffer | null>;
@@ -83,13 +85,16 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
             result = new Uint8Array(r.pages[0].bytes);
             fileName = `page_${r.pages[0].index + 1}.pdf`;
           } else {
-            // Download all as zip-like individual files
+            // 多页：合并成一个 PDF 上传到 R2（Ready 页只支持单文件付费下载）
+            addLog(`Merging ${r.pages.length} split pages into one PDF...`);
+            const merged = await PDFDocument.create();
             for (const p of r.pages) {
-              downloadPDF(new Uint8Array(p.bytes), `page_${p.index + 1}.pdf`);
+              const doc = await PDFDocument.load(p.bytes);
+              const pages = await merged.copyPages(doc, doc.getPageIndices());
+              pages.forEach((pg) => merged.addPage(pg));
             }
-            addLog(`Downloaded ${r.pages.length} individual page(s).`);
-            setProcessingTool(null);
-            return;
+            result = new Uint8Array(await merged.save());
+            fileName = `split_merged.pdf`;
           }
           addLog(`Split: ${r.totalPages} pages into ${r.pages.length} file(s).`);
           break;
@@ -142,29 +147,32 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           addLog(`Converting PDF to JPG images...`);
           const r = await convertPdfToJpg(sourceBytes, { scale: 2, quality: 0.92 });
           addLog(`Rendered ${r.count} page(s) to JPG.`);
-          // 多页逐个下载（与 split 一致）
-          for (const p of r.blobs) {
-            const url = URL.createObjectURL(p.blob);
-            const a = document.createElement("a");
-            a.href = url;
-            a.download = `page_${p.index + 1}.jpg`;
-            a.click();
-            URL.revokeObjectURL(url);
+          // 多页：把所有 JPG 合并成一个 PDF 上传到 R2
+          if (r.blobs.length === 1) {
+            result = r.blobs[0].blob;
+            fileName = `page_${r.blobs[0].index + 1}.jpg`;
+          } else {
+            addLog(`Merging ${r.count} JPG images into one PDF...`);
+            const merged = await PDFDocument.create();
+            for (const p of r.blobs) {
+              const jpgBytes = new Uint8Array(await p.blob.arrayBuffer());
+              const img = await merged.embedJpg(jpgBytes);
+              const page = merged.addPage([img.width, img.height]);
+              page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+            }
+            result = new Uint8Array(await merged.save());
+            fileName = `pdf_to_jpg.pdf`;
           }
-          addLog(`📥 Downloaded ${r.count} JPG file(s).`);
-          setProcessingTool(null);
-          return;
+          break;
         }
       }
 
       if (result) {
-        addLog(`✅ ${tool} complete. Downloading...`);
-        const blob = result instanceof Blob ? result : new Blob([result], { type: "application/octet-stream" });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url; a.download = fileName; a.click();
-        URL.revokeObjectURL(url);
-        addLog(`📥 Downloaded: ${fileName}`);
+        addLog(`✅ ${tool} complete. Uploading to PDFSail...`);
+        const blob = result instanceof Blob ? result : new Blob([result as BlobPart], { type: "application/octet-stream" });
+        addLog(`Redirecting to checkout...`);
+        // 上传到 R2 + 跳转 Ready 页（付费下载），失败时 fallback 本地下载
+        await uploadToR2AndRedirect(blob, fileName, tool);
       }
       // Update workspace state
       if (workspaceMode) {
