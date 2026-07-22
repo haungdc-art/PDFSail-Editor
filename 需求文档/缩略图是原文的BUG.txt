@@ -1,0 +1,28 @@
+1、修改后，download,跳转到ready,看到的缩略图，是原文，不是修改后的文件
+2、Cloudflare Cron / Worker
+
+你现在已经大量使用 Cloudflare，这个也可以。
+
+结构：
+
+Cloudflare Worker Cron
+
+每10分钟
+
+↓
+
+fetch(render-url/health)
+
+↓
+
+Render
+
+例如：
+
+export default {
+ async scheduled(event, env, ctx) {
+   await fetch(
+     "https://pdfsail-editor.onrender.com/health"
+   );
+ }
+}

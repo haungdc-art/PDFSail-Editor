@@ -277,6 +277,8 @@ export function PDFCanvas({
                         : b.type === "highlight" ? `2px solid ${b.color || "#facc15"}`
                         : b.type === "redact" ? "2px solid #1e293b"
                         : b.type === "comment" ? "1px dashed #6366f1"
+                        : b.type === "signature"
+                        ? selectedBlockId === b.id ? "2px solid #8b5cf6" : "none"
                         : selectedBlockId === b.id ? "2px solid #8b5cf6" : "1px solid #3b82f6",
                       borderRadius: 4,
                       cursor: b.type === "text" ? "grab" : "move",

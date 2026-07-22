@@ -10,6 +10,7 @@
  */
 
 import { useEditor } from "../core/EditorProvider";
+import { useI18n } from "../../i18n/I18nProvider";
 
 interface SidePanelProps {
   handleAddBlankPage: () => void;
@@ -54,6 +55,7 @@ export function SidePanel({
     docBlocks,
     setBlocks,
   } = useEditor();
+  const { t } = useI18n();
 
   if (!pdfDoc) return null;
 
@@ -85,12 +87,12 @@ export function SidePanel({
             letterSpacing: 0.5,
           }}
         >
-          Page Controls
+          {t("panel.pageControls")}
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
           <button
             onClick={handleAddBlankPage}
-            title="Add blank page"
+            title={t("panel.addBlankPage")}
             style={{
               width: 28, height: 28, borderRadius: 4, border: "1px solid #e2e8f0",
               background: "#fff", cursor: "pointer", fontSize: 16,
@@ -101,7 +103,7 @@ export function SidePanel({
           </button>
           <button
             onClick={handleDeletePage}
-            title="Delete this page"
+            title={t("panel.deletePage")}
             disabled={totalPages <= 1}
             style={{
               width: 28, height: 28, borderRadius: 4, border: "1px solid #e2e8f0",
@@ -114,11 +116,11 @@ export function SidePanel({
             −
           </button>
           <span style={{ padding: "0 6px", fontWeight: 600, color: "#1e293b", fontSize: 13 }}>{totalPages}</span>
-          <span style={{ fontSize: 11, color: "#94a3b8" }}>pages</span>
+          <span style={{ fontSize: 11, color: "#94a3b8" }}>{t("panel.pages")}</span>
           <div style={{ width: 1, height: 20, background: "#e2e8f0", margin: "0 4px" }} />
           <button
             onClick={handleMovePageUp}
-            title="Move page up"
+            title={t("panel.movePageUp")}
             disabled={page <= 1}
             style={{
               width: 28, height: 28, borderRadius: 4, border: "1px solid #e2e8f0",
@@ -132,7 +134,7 @@ export function SidePanel({
           </button>
           <button
             onClick={handleMovePageDown}
-            title="Move page down"
+            title={t("panel.movePageDown")}
             disabled={page >= totalPages}
             style={{
               width: 28, height: 28, borderRadius: 4, border: "1px solid #e2e8f0",
@@ -145,14 +147,14 @@ export function SidePanel({
             ↓
           </button>
         </div>
-        <div style={{ marginTop: 6, fontSize: 11, color: "#94a3b8" }}>Page {page} of {totalPages}</div>
+        <div style={{ marginTop: 6, fontSize: 11, color: "#94a3b8" }}>{t("panel.pageOf")} {page} {t("panel.of")} {totalPages}</div>
       </div>
 
       {/* ── Workspace Section ── */}
       {workspaceMode && wsAction && (
         <div style={{ marginBottom: 16, padding: "12px", background: "#1a1a2e", borderRadius: 8 }}>
           <div style={{ fontSize: 10, fontWeight: 700, color: "#7c5cfc", textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
-            {wsActionsDone.length === 0 ? "Recommended Action" : "Next Step"}
+            {wsActionsDone.length === 0 ? t("panel.recommendedAction") : t("panel.nextStep")}
           </div>
           <div style={{ color: "#e0e0e0", fontSize: 14, fontWeight: 600, marginBottom: 4 }}>{wsAction.label}</div>
           <div style={{ color: "#888", fontSize: 11, lineHeight: 1.4, marginBottom: 10 }}>{wsAction.reason}</div>
@@ -165,26 +167,26 @@ export function SidePanel({
               fontSize: 13, fontWeight: 600, cursor: "pointer", opacity: processingTool ? 0.5 : 1,
             }}
           >
-            Execute
+            {t("panel.execute")}
           </button>
         </div>
       )}
       {workspaceMode && wsHints.length > 0 && wsActionsDone.length === 0 && !wsAction && (
         <div style={{ marginBottom: 12, padding: "8px 12px", background: "#0d0d1a", borderRadius: 8, fontSize: 11, color: "#b0b0b0" }}>
-          <div style={{ fontWeight: 600, color: "#94a3b8", marginBottom: 4 }}>Detected</div>
+          <div style={{ fontWeight: 600, color: "#94a3b8", marginBottom: 4 }}>{t("panel.detected")}</div>
           {wsHints.map((h, i) => <div key={i}>• {h.text}</div>)}
         </div>
       )}
       {workspaceMode && wsActionsDone.length > 0 && (
         <div style={{ marginBottom: 12, padding: "8px 12px", background: "#0d0d1a", borderRadius: 8, fontSize: 11 }}>
-          <div style={{ color: "#4ade80", fontWeight: 600, marginBottom: 4 }}>✓ Completed ({wsActionsDone.length})</div>
+          <div style={{ color: "#4ade80", fontWeight: 600, marginBottom: 4 }}>✓ {t("panel.completed")} ({wsActionsDone.length})</div>
           {wsActionsDone.map((a, i) => <div key={i} style={{ color: "#b0b0b0" }}>✔ {a}</div>)}
         </div>
       )}
       {workspaceMode && wsShowFlow && (
         <div style={{ marginBottom: 16, padding: "12px", background: "rgba(124,92,252,0.08)", borderRadius: 8, border: "1px solid rgba(124,92,252,0.2)" }}>
-          <div style={{ color: "#c0b0e0", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>✔ Your document is ready</div>
-          <div style={{ color: "#888", fontSize: 11, marginBottom: 10, lineHeight: 1.4 }}>Send directly or download?</div>
+          <div style={{ color: "#c0b0e0", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>✔ {t("panel.docReady")}</div>
+          <div style={{ color: "#888", fontSize: 11, marginBottom: 10, lineHeight: 1.4 }}>{t("panel.sendOrDownload")}</div>
           <button
             onClick={() => {
               setProcessingTool("flow");
@@ -201,7 +203,7 @@ export function SidePanel({
               cursor: "pointer", marginBottom: 4,
             }}
           >
-            📧 Send via Email
+            📧 {t("panel.sendViaEmail")}
           </button>
           <button
             onClick={() => { handleExport(); }}
@@ -210,7 +212,7 @@ export function SidePanel({
               background: "transparent", color: "#ccc", fontSize: 12, cursor: "pointer",
             }}
           >
-            ⬇️ Download
+            ⬇️ {t("panel.download")}
           </button>
         </div>
       )}
@@ -221,15 +223,15 @@ export function SidePanel({
       <div style={{ marginBottom: 16 }}>
         {!addingType && !selectedBlockId && pdfDoc && !workspaceMode && (
           <div style={{ color: "#94a3b8", fontSize: 11, lineHeight: 1.5 }}>
-            Select a tool from the toolbar above, or click on text to edit it. Tool options will appear here.
+            {t("panel.selectTool")}
           </div>
         )}
 
         {(!addingType || addingType === "text") && pdfDoc && (
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>Text Style</div>
+            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>{t("panel.textStyle")}</div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Font</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.font")}</div>
               <select
                 value={textFormat.fontFamily}
                 onChange={(e) => { setTextFormat((p) => ({ ...p, fontFamily: e.target.value })); updateSelectedFormat({ fontFamily: e.target.value }); }}
@@ -245,7 +247,7 @@ export function SidePanel({
               </select>
             </div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Size</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.size")}</div>
               <input
                 type="number"
                 value={textFormat.fontSize}
@@ -260,7 +262,7 @@ export function SidePanel({
               />
             </div>
             <div>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Color</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.color")}</div>
               <input
                 type="color"
                 value={textFormat.color}
@@ -273,9 +275,9 @@ export function SidePanel({
 
         {addingType === "highlight" && (
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>Highlight Options</div>
+            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>{t("panel.highlightOptions")}</div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Type</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.type")}</div>
               <select
                 value={highlightFormat.type}
                 onChange={(e) => setHighlightFormat((p) => ({ ...p, type: e.target.value as any }))}
@@ -289,7 +291,7 @@ export function SidePanel({
               </select>
             </div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Color</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.color")}</div>
               <div style={{ display: "flex", gap: 4 }}>
                 {["#facc15", "#f87171", "#4ade80", "#60a5fa", "#a78bfa"].map((c) => (
                   <button
@@ -305,7 +307,7 @@ export function SidePanel({
               </div>
             </div>
             <div>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Opacity ({highlightFormat.opacity}%)</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.opacity")} ({highlightFormat.opacity}%)</div>
               <input
                 type="range"
                 min={10}
@@ -320,9 +322,9 @@ export function SidePanel({
 
         {addingType === "annotate" && (
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>Annotation Options</div>
+            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>{t("panel.annotationOptions")}</div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Type</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.type")}</div>
               <select
                 value={annoFormat.aType}
                 onChange={(e) => setAnnoFormat((p) => ({ ...p, aType: e.target.value as any }))}
@@ -335,7 +337,7 @@ export function SidePanel({
               </select>
             </div>
             <div style={{ marginBottom: 8 }}>
-              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>Color</div>
+              <div style={{ marginBottom: 4, fontSize: 11, color: "#64748b" }}>{t("panel.color")}</div>
               <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
                 {["#3b82f6", "#facc15", "#f87171", "#4ade80", "#a78bfa", "#1e293b"].map((c) => (
                   <button
@@ -350,24 +352,24 @@ export function SidePanel({
                 ))}
               </div>
             </div>
-            <div style={{ color: "#94a3b8", fontSize: 11 }}>Click on text to annotate</div>
+            <div style={{ color: "#94a3b8", fontSize: 11 }}>{t("panel.clickToAnnotate")}</div>
           </div>
         )}
 
         {addingType === "redact" && (
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>Redact Options</div>
+            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>{t("panel.redactOptions")}</div>
             <div style={{ color: "#64748b", fontSize: 11, lineHeight: 1.5 }}>
-              Draw a rectangle over the content you want to permanently redact.
+              {t("panel.redactHint")}
             </div>
           </div>
         )}
 
         {addingType === "ocr" && (
           <div>
-            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>OCR Options</div>
+            <div style={{ fontWeight: 700, marginBottom: 8, color: "#1e293b", fontSize: 11, textTransform: "uppercase", letterSpacing: 0.5 }}>{t("panel.ocrOptions")}</div>
             <div style={{ color: "#64748b", fontSize: 11, lineHeight: 1.5 }}>
-              Select a region to run text recognition (OCR) on that area.
+              {t("panel.ocrHint")}
             </div>
           </div>
         )}
@@ -384,7 +386,7 @@ export function SidePanel({
             display: "flex", alignItems: "center", justifyContent: "space-between",
           }}
         >
-          <span>Blocks ({pageBlocks.length})</span>
+          <span>{t("panel.blocks")} ({pageBlocks.length})</span>
           {pageBlocks.length > 0 && (
             <button
               onClick={() => setBlocks([])}
@@ -393,11 +395,11 @@ export function SidePanel({
                 color: "#ef4444", cursor: "pointer", fontSize: 10, padding: "2px 6px",
               }}
             >
-              Clear All
+              {t("panel.clearAll")}
             </button>
           )}
         </div>
-        {pageBlocks.length === 0 && <div style={{ color: "#94a3b8", fontSize: 11 }}>No blocks on this page</div>}
+        {pageBlocks.length === 0 && <div style={{ color: "#94a3b8", fontSize: 11 }}>{t("panel.noBlocks")}</div>}
         {pageBlocks.map((b) => (
           <div
             key={b.id}

@@ -25,6 +25,7 @@ import { usePageOps } from "./features/usePageOps";
 import { useExport } from "./features/useExport";
 import { usePayment } from "./features/usePayment";
 import { useInlineTools } from "./features/useInlineTools";
+import { useI18n } from "../i18n/I18nProvider";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
@@ -82,6 +83,7 @@ function PDFEditorInner() {
     rotateDeg, setRotateDeg, rotateMode, setRotateMode,
     pageNumOpts, setPageNumOpts, compressQuality, setCompressQuality,
   } = useEditor();
+  const { t } = useI18n();
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -318,7 +320,7 @@ function PDFEditorInner() {
         borderBottom: "1px solid #e2e8f0",
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <span style={{ fontSize: 16, fontWeight: 700, color: "#1e293b" }}>📄 PDFSail Editor</span>
+          <span style={{ fontSize: 16, fontWeight: 700, color: "#1e293b" }}>{t("app.header")}</span>
           {pdfDoc && (
             <span style={{ fontSize: 12, color: "#64748b" }}>{fileName}</span>
           )}

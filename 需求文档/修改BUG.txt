@@ -1,0 +1,11 @@
+修改BUG
+1、打开PDF,edit，文字重叠，无法看清，点击edit按钮，关闭edit，重影消失；
+2、点击Edit，打开编辑模式，在原文的基础上又显示一层文本，并且字体比原文要大，所以产生了重叠；
+3、部署到render，域名：https://pdfsail-editor.onrender.com，报错
+==> Cloning from https://github.com/haungdc-art/PDFSail-Editor
+==> Checking out commit 7ddbb2333e35bc715d0b93adb667780adb4ada9e in branch main
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 2B done
+#1 DONE 0.0s
+error: failed to solve: failed to read dockerfile: open Dockerfile: no such file or directory
+error: exit status 1

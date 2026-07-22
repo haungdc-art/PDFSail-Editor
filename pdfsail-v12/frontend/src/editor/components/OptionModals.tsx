@@ -12,6 +12,7 @@ import { useEditor } from "../core/EditorProvider";
 import { Modal } from "./Modal";
 import SignaturePad from "../SignaturePad";
 import type { Block } from "../types";
+import { useI18n } from "../../i18n/I18nProvider";
 
 interface OptionModalsProps {
   addBlock: (type: Block["type"], extra?: any) => void;
@@ -85,6 +86,7 @@ export function OptionModals({
     pageNumOpts,
     setPageNumOpts,
   } = useEditor();
+  const { t } = useI18n();
 
   return (
     <>
@@ -120,7 +122,7 @@ export function OptionModals({
             }}
           >
             <h3 style={{ margin: "0 0 8px", fontSize: 18, color: "#1e293b" }}>
-              Free limit reached
+              {t("modal.freeLimit")}
             </h3>
             <p
               style={{
@@ -129,7 +131,7 @@ export function OptionModals({
                 color: "#64748b",
               }}
             >
-              You've used all 3 free exports today. Pay $1.99 to export this PDF.
+              {t("modal.payHint")}
             </p>
             <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
               <button
@@ -149,7 +151,7 @@ export function OptionModals({
                   gap: 8,
                 }}
               >
-                💳 Pay with Card (Stripe)
+                💳 {t("modal.payCard")}
               </button>
               <button
                 onClick={handlePaypalPay}
@@ -171,7 +173,7 @@ export function OptionModals({
                 <span style={{ color: "#0070ba", fontWeight: 700, fontSize: 16 }}>
                   PayPal
                 </span>{" "}
-                Pay with PayPal
+                {t("modal.payPaypal")}
               </button>
               <button
                 onClick={() => setShowPayModal(false)}
@@ -185,7 +187,7 @@ export function OptionModals({
                   fontSize: 12,
                 }}
               >
-                Cancel
+                {t("common.cancel")}
               </button>
             </div>
           </div>
@@ -194,7 +196,7 @@ export function OptionModals({
 
       {/* ── Workspace Intent Modal ── */}
       {showIntentModal && (
-        <Modal title="What are you trying to do?" onClose={() => setShowIntentModal(false)}>
+        <Modal title={t("modal.intentTitle")} onClose={() => setShowIntentModal(false)}>
           <p
             style={{
               fontSize: 12,
@@ -203,15 +205,14 @@ export function OptionModals({
               lineHeight: 1.5,
             }}
           >
-            Setting your intent helps us suggest the most relevant next steps for
-            your document.
+            {t("modal.intentDesc")}
           </p>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
             {[
-              { key: "compress", label: "📦 Compress", desc: "Reduce file size" },
-              { key: "edit", label: "✏️ Edit", desc: "Modify document content" },
-              { key: "convert", label: "🔄 Convert", desc: "Change document format" },
-              { key: "other", label: "📄 Other", desc: "Something else" },
+              { key: "compress", label: "📦 Compress", desc: t("modal.intentCompress") },
+              { key: "edit", label: "✏️ Edit", desc: t("modal.intentEdit") },
+              { key: "convert", label: "🔄 Convert", desc: t("modal.intentConvert") },
+              { key: "other", label: "📄 Other", desc: t("modal.intentOther") },
             ].map((opt) => (
               <button
                 key={opt.key}
@@ -311,7 +312,7 @@ export function OptionModals({
                 }}
               />
               <span style={{ color: "#e0e0e0", fontSize: 16, fontWeight: 600 }}>
-                Processing: {processingTool}
+                {t("modal.processing")}: {processingTool}
               </span>
             </div>
             <div
@@ -349,7 +350,7 @@ export function OptionModals({
 
       {/* ── Compress Options Modal ── */}
       {showCompressOptions && (
-        <Modal title="Compress PDF" onClose={() => setShowCompressOptions(false)}>
+        <Modal title={t("modal.compressTitle")} onClose={() => setShowCompressOptions(false)}>
           <label
             style={{
               fontSize: 12,
@@ -358,7 +359,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Image Quality: {compressQuality}%
+            {t("modal.imageQuality")}: {compressQuality}%
           </label>
           <input
             type="range"
@@ -377,8 +378,8 @@ export function OptionModals({
               marginBottom: 16,
             }}
           >
-            <span>Smaller size</span>
-            <span>Better quality</span>
+            <span>{t("modal.smallerSize")}</span>
+            <span>{t("modal.betterQuality")}</span>
           </div>
           <div
             style={{
@@ -391,9 +392,9 @@ export function OptionModals({
               borderRadius: 6,
             }}
           >
-            Lower quality = smaller file size but possible image degradation.
+            {t("modal.compressHint")}
             <br />
-            Recommended: 40–70 for web, 70–90 for print.
+            {t("modal.compressHint2")}
           </div>
           <button
             onClick={() => {
@@ -412,14 +413,14 @@ export function OptionModals({
               cursor: "pointer",
             }}
           >
-            Compress
+            {t("modal.compressBtn")}
           </button>
         </Modal>
       )}
 
       {/* ── Split Options Modal ── */}
       {showSplitOptions && (
-        <Modal title="Split PDF" onClose={() => setShowSplitOptions(false)}>
+        <Modal title={t("modal.splitTitle")} onClose={() => setShowSplitOptions(false)}>
           <label
             style={{
               fontSize: 12,
@@ -428,7 +429,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Mode
+            {t("modal.mode")}
           </label>
           <select
             value={splitMode}
@@ -442,8 +443,8 @@ export function OptionModals({
               marginBottom: 12,
             }}
           >
-            <option value="all">All pages (one file per page)</option>
-            <option value="range">Page range</option>
+            <option value="all">{t("modal.allPages")}</option>
+            <option value="range">{t("modal.pageRange")}</option>
           </select>
           {splitMode === "range" && (
             <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
@@ -456,7 +457,7 @@ export function OptionModals({
                     marginBottom: 2,
                   }}
                 >
-                  From
+                  {t("modal.from")}
                 </label>
                 <input
                   type="number"
@@ -484,7 +485,7 @@ export function OptionModals({
                     marginBottom: 2,
                   }}
                 >
-                  To
+                  {t("modal.to")}
                 </label>
                 <input
                   type="number"
@@ -514,7 +515,7 @@ export function OptionModals({
                   paddingBottom: 6,
                 }}
               >
-                {totalPages} pages total
+                {totalPages} {t("modal.pagesTotal")}
               </div>
             </div>
           )}
@@ -538,14 +539,14 @@ export function OptionModals({
               cursor: "pointer",
             }}
           >
-            Split
+            {t("modal.splitBtn")}
           </button>
         </Modal>
       )}
 
       {/* ── Rotate Options Modal ── */}
       {showRotateOptions && (
-        <Modal title="Rotate PDF" onClose={() => setShowRotateOptions(false)}>
+        <Modal title={t("modal.rotateTitle")} onClose={() => setShowRotateOptions(false)}>
           <label
             style={{
               fontSize: 12,
@@ -554,7 +555,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Angle
+            {t("modal.angle")}
           </label>
           <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
             {[90, 180, 270].map((d) => (
@@ -587,7 +588,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Apply to
+            {t("modal.applyTo")}
           </label>
           <select
             value={rotateMode}
@@ -601,8 +602,8 @@ export function OptionModals({
               marginBottom: 12,
             }}
           >
-            <option value="all">All pages</option>
-            <option value="current">Current page only</option>
+            <option value="all">{t("modal.allPages2")}</option>
+            <option value="current">{t("modal.currentPage")}</option>
           </select>
           <button
             onClick={() => {
@@ -625,14 +626,14 @@ export function OptionModals({
               cursor: "pointer",
             }}
           >
-            Rotate
+            {t("modal.rotateBtn")}
           </button>
         </Modal>
       )}
 
       {/* ── Page Number Options Modal ── */}
       {showPageNumOptions && (
-        <Modal title="Add Page Numbers" onClose={() => setShowPageNumOptions(false)}>
+        <Modal title={t("modal.pageNumTitle")} onClose={() => setShowPageNumOptions(false)}>
           <label
             style={{
               fontSize: 12,
@@ -641,7 +642,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Position
+            {t("modal.position")}
           </label>
           <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
             {["top", "bottom"].map((p) => (
@@ -662,7 +663,7 @@ export function OptionModals({
                   fontWeight: pageNumOpts.position === p ? 700 : 500,
                 }}
               >
-                {p === "top" ? "Top" : "Bottom"}
+                {p === "top" ? t("modal.top") : t("modal.bottom")}
               </button>
             ))}
           </div>
@@ -674,7 +675,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Alignment
+            {t("modal.alignment")}
           </label>
           <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
             {["left", "center", "right"].map((a) => (
@@ -707,7 +708,7 @@ export function OptionModals({
               marginBottom: 4,
             }}
           >
-            Format
+            {t("modal.format")}
           </label>
           <input
             value={pageNumOpts.format}
@@ -733,7 +734,7 @@ export function OptionModals({
                   marginBottom: 2,
                 }}
               >
-                Start from
+                {t("modal.startFrom")}
               </label>
               <input
                 type="number"
@@ -763,7 +764,7 @@ export function OptionModals({
                   marginBottom: 2,
                 }}
               >
-                Font size
+                {t("modal.fontSize")}
               </label>
               <input
                 type="number"
@@ -803,7 +804,7 @@ export function OptionModals({
               cursor: "pointer",
             }}
           >
-            Add Numbers
+            {t("modal.addNumbers")}
           </button>
         </Modal>
       )}

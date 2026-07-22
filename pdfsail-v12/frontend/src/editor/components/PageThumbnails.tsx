@@ -8,6 +8,7 @@
  */
 
 import { useEditor } from "../core/EditorProvider";
+import { useI18n } from "../../i18n/I18nProvider";
 
 export function PageThumbnails() {
   const {
@@ -18,6 +19,7 @@ export function PageThumbnails() {
     page,
     setPage,
   } = useEditor();
+  const { t } = useI18n();
 
   if (!pdfDoc) return null;
 
@@ -44,7 +46,7 @@ export function PageThumbnails() {
             }}
           >
             <span style={{ fontSize: 11, fontWeight: 700, color: "#64748b" }}>
-              Pages {thumbnails.length > 0 ? `(${thumbnails.length})` : ""}
+              {t("toolbar.pages")} {thumbnails.length > 0 ? `(${thumbnails.length})` : ""}
             </span>
             <button
               onClick={() => setThumbnailCol(false)}
@@ -164,7 +166,7 @@ export function PageThumbnails() {
               marginTop: 8,
             }}
           >
-            Pages
+            {t("toolbar.pages")}
           </span>
         </div>
       )}

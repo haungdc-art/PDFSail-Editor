@@ -1,4 +1,5 @@
 import React, { useRef, useState } from "react";
+import { useI18n } from "../i18n/I18nProvider";
 
 export default function SignaturePad({
   onSave,
@@ -7,6 +8,7 @@ export default function SignaturePad({
   onSave: (dataUrl: string) => void;
   onCancel: () => void;
 }) {
+  const { t } = useI18n();
   const [mode, setMode] = useState<"handwriting" | "photo" | "artistic">("handwriting");
   const [artText, setArtText] = useState("John Doe");
   const [artColor, setArtColor] = useState("#1e293b");
@@ -115,12 +117,12 @@ export default function SignaturePad({
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.4)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
       <div style={{ background: "#fff", borderRadius: 12, padding: 24, width: 480, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 8px 32px rgba(0,0,0,0.2)" }}>
-        <h3 style={{ margin: "0 0 16px", fontSize: 18, color: "#1e293b" }}>Add Signature</h3>
+        <h3 style={{ margin: "0 0 16px", fontSize: 18, color: "#1e293b" }}>{t("sig.title")}</h3>
 
         <div style={{ display: "flex", gap: 8, marginBottom: 16, background: "#f1f5f9", borderRadius: 8, padding: 4 }}>
           {(["handwriting", "photo", "artistic"] as const).map((m) => (
             <button key={m} onClick={() => setMode(m)} style={{ flex: 1, padding: "8px 12px", borderRadius: 6, border: "none", background: mode === m ? "#fff" : "transparent", color: mode === m ? "#1e293b" : "#64748b", fontWeight: mode === m ? 600 : 500, cursor: "pointer", boxShadow: mode === m ? "0 1px 3px rgba(0,0,0,0.08)" : "none" }}>
-              {m === "handwriting" ? "✍ Handwriting" : m === "photo" ? "📷 Photo" : "✨ Artistic"}
+              {m === "handwriting" ? t("sig.handwriting") : m === "photo" ? t("sig.photo") : t("sig.artistic")}
             </button>
           ))}
         </div>
@@ -128,31 +130,31 @@ export default function SignaturePad({
         {mode === "handwriting" && (
           <>
             <canvas ref={canvasRef} width={400} height={200} onMouseDown={startDraw} onMouseMove={draw} onMouseUp={stopDraw} onMouseLeave={stopDraw} style={{ border: "1px solid #cbd5e1", borderRadius: 8, cursor: "crosshair", background: "#fff", width: "100%" }} />
-            <button onClick={clear} style={{ marginTop: 8, ...sigBtn }}>Clear</button>
+            <button onClick={clear} style={{ marginTop: 8, ...sigBtn }}>{t("sig.clear")}</button>
           </>
         )}
 
         {mode === "photo" && (
           <div style={{ border: "2px dashed #cbd5e1", borderRadius: 8, padding: 32, textAlign: "center" }}>
             <input ref={fileInputRef} type="file" accept="image/*" onChange={handlePhoto} style={{ display: "none" }} />
-            <button onClick={() => fileInputRef.current?.click()} style={{ ...sigBtn, background: "#3b82f6", color: "#fff" }}>Choose Photo</button>
+            <button onClick={() => fileInputRef.current?.click()} style={{ ...sigBtn, background: "#3b82f6", color: "#fff" }}>{t("sig.choosePhoto")}</button>
             {photoData && <img src={photoData} alt="signature" style={{ display: "block", maxWidth: "100%", maxHeight: 160, marginTop: 12, border: "1px solid #e2e8f0", borderRadius: 4 }} />}
           </div>
         )}
 
         {mode === "artistic" && (
           <>
-            <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>Full Name</label>
+            <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>{t("sig.fullName")}</label>
             <input value={artText} onChange={(e) => setArtText(e.target.value)} style={{ width: "100%", padding: "8px 12px", borderRadius: 6, border: "1px solid #e2e8f0", marginBottom: 12, fontSize: 14 }} />
 
-            <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>Color</label>
+            <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>{t("sig.color")}</label>
             <div style={{ display: "grid", gridTemplateColumns: "repeat(8, 1fr)", gap: 6, marginBottom: 12 }}>
               {colors.map((c) => (
                 <button key={c} onClick={() => setArtColor(c)} style={{ width: "100%", aspectRatio: "1", borderRadius: 4, border: artColor === c ? "2px solid #1e293b" : "1px solid #e2e8f0", background: c, cursor: "pointer" }} />
               ))}
             </div>
 
-            <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>Style</label>
+            <label style={{ fontSize: 12, color: "#64748b", marginBottom: 4, display: "block" }}>{t("sig.style")}</label>
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 8 }}>
               {fonts.slice(fontPage * FONTS_PER_PAGE, (fontPage + 1) * FONTS_PER_PAGE).map((f) => (
                 <button key={f.value} onClick={() => setArtFont(f.value)} style={{ display: "flex", alignItems: "center", gap: 8, padding: 10, borderRadius: 6, border: artFont === f.value ? "2px solid #3b82f6" : "1px solid #e2e8f0", background: artFont === f.value ? "#eff6ff" : "#fff", cursor: "pointer" }}>
@@ -192,8 +194,8 @@ export default function SignaturePad({
         )}
 
         <div style={{ display: "flex", gap: 8, justifyContent: "center", marginTop: 16 }}>
-          <button onClick={handleSave} style={{ ...sigBtn, background: "#3b82f6", color: "#fff" }}>Use Signature</button>
-          <button onClick={onCancel} style={{ ...sigBtn, color: "#ef4444" }}>Cancel</button>
+          <button onClick={handleSave} style={{ ...sigBtn, background: "#3b82f6", color: "#fff" }}>{t("sig.useSignature")}</button>
+          <button onClick={onCancel} style={{ ...sigBtn, color: "#ef4444" }}>{t("sig.cancel")}</button>
         </div>
       </div>
     </div>

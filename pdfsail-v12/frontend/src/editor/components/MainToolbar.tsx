@@ -11,6 +11,7 @@
 
 import type { RefObject } from "react";
 import { useEditor } from "../core/EditorProvider";
+import { useI18n } from "../../i18n/I18nProvider";
 
 const btn: React.CSSProperties = {
   padding: "7px 12px",
@@ -80,6 +81,7 @@ export function MainToolbar({
     page,
     totalPages,
   } = useEditor();
+  const { t } = useI18n();
 
   return (
     <div
@@ -102,7 +104,7 @@ export function MainToolbar({
           fontWeight: 600,
         }}
       >
-        Upload PDF
+        {t("toolbar.upload")}
         <input
           type="file"
           accept=".pdf"
@@ -123,7 +125,7 @@ export function MainToolbar({
             color: "#64748b",
           }}
         >
-          📄 Pages
+          {t("toolbar.pages")}
         </button>
       )}
       {pdfDoc && false && (
@@ -160,10 +162,10 @@ export function MainToolbar({
         }
         style={btn}
       >
-        T Text
+        {t("toolbar.text")}
       </button>
       <button onClick={() => imageInputRef.current?.click()} style={btn}>
-        🖼 Image
+        {t("toolbar.image")}
       </button>
       <input
         ref={imageInputRef}
@@ -182,7 +184,7 @@ export function MainToolbar({
           fontWeight: addingType === "highlight" ? 700 : 500,
         }}
       >
-        🟡 Highlight
+        {t("toolbar.highlight")}
       </button>
       <button
         onClick={() => setAddingType(addingType === "redact" ? null : "redact")}
@@ -194,10 +196,10 @@ export function MainToolbar({
           fontWeight: addingType === "redact" ? 700 : 500,
         }}
       >
-        ⬛ Redact
+        {t("toolbar.redact")}
       </button>
       <button onClick={() => setShowSignature(true)} style={btn}>
-        ✍ Signature
+        {t("toolbar.signature")}
       </button>
       <button
         onClick={() => setAddingType(addingType === "annotate" ? null : "annotate")}
@@ -209,7 +211,7 @@ export function MainToolbar({
           fontWeight: addingType === "annotate" ? 700 : 500,
         }}
       >
-        📌 Annotate
+        {t("toolbar.annotate")}
       </button>
       <div style={sep} />
       <button
@@ -222,7 +224,7 @@ export function MainToolbar({
           fontWeight: showTextLayer ? 700 : 500,
         }}
       >
-        ✏️ Edit
+        {t("toolbar.edit")}
       </button>
       <div style={sep} />
       <button
@@ -230,14 +232,14 @@ export function MainToolbar({
         style={{ ...btn, opacity: undoRef.canUndo ? 1 : 0.35 }}
         disabled={!undoRef.canUndo}
       >
-        ↩ Undo
+        {t("toolbar.undo")}
       </button>
       <button
         onClick={handleRedo}
         style={{ ...btn, opacity: undoRef.canRedo ? 1 : 0.35 }}
         disabled={!undoRef.canRedo}
       >
-        ↪ Redo
+        {t("toolbar.redo")}
       </button>
       <div style={sep} />
       <button
@@ -245,7 +247,7 @@ export function MainToolbar({
         style={{ ...btn, background: ocrBusy ? "#94a3b8" : "#f59e0b", color: "#fff" }}
         disabled={ocrBusy || !pdfDoc}
       >
-        {ocrBusy ? "⏳ OCR..." : "🔍 OCR Page"}
+        {ocrBusy ? t("toolbar.ocrBusy") : t("toolbar.ocrPage")}
       </button>
       <button
         onClick={() => setAddingType(addingType === "ocr" ? null : "ocr")}
@@ -258,7 +260,7 @@ export function MainToolbar({
         }}
         disabled={ocrBusy || !pdfDoc}
       >
-        🎯 OCR Region
+        {t("toolbar.ocrRegion")}
       </button>
       <div style={sep} />
       <div style={{ position: "relative" }}>
@@ -271,7 +273,7 @@ export function MainToolbar({
             fontWeight: 600,
           }}
         >
-          🔧 Convert ▾
+          {t("toolbar.convert")}
         </button>
         {showTools && (
           <div
@@ -291,14 +293,14 @@ export function MainToolbar({
             onMouseLeave={() => setShowTools(false)}
           >
             {[
-              { label: "📦 Compress PDF", key: "compress", needsOpts: true },
-              { label: "✂️ Split PDF", key: "split", needsOpts: true },
-              { label: "🔄 Rotate PDF", key: "rotate", needsOpts: true },
-              { label: "🔢 Add Page Numbers", key: "pagenum", needsOpts: true },
-              { label: "📝 PDF to Word", key: "word", needsOpts: false },
-              { label: "📊 PDF to Excel", key: "excel", needsOpts: false },
-              { label: "🧹 Remove Watermark", key: "watermark", needsOpts: false },
-              { label: "🔗 Merge PDF", key: "merge", needsOpts: false },
+              { label: t("toolbar.compress"), key: "compress", needsOpts: true },
+              { label: t("toolbar.split"), key: "split", needsOpts: true },
+              { label: t("toolbar.rotate"), key: "rotate", needsOpts: true },
+              { label: t("toolbar.pageNum"), key: "pagenum", needsOpts: true },
+              { label: t("toolbar.toWord"), key: "word", needsOpts: false },
+              { label: t("toolbar.toExcel"), key: "excel", needsOpts: false },
+              { label: t("toolbar.watermark"), key: "watermark", needsOpts: false },
+              { label: t("toolbar.merge"), key: "merge", needsOpts: false },
             ].map((item) => {
               const handleClick = () => {
                 setShowTools(false);
@@ -346,7 +348,7 @@ export function MainToolbar({
         }}
         style={{ ...btn, color: "#ef4444", borderColor: "#fecaca" }}
       >
-        🗑 Clear
+        {t("toolbar.clear")}
       </button>
       {pdfDoc && (
         <span style={{ fontSize: 12, color: "#94a3b8", marginLeft: 4 }}>
