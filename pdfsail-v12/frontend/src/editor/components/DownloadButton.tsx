@@ -62,6 +62,10 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
 
   const start = async () => {
     if (disabled || phase !== "idle") return;
+    // 上报 Google Ads 转化（用户点击 Download 按钮时触发）
+    if (typeof window !== "undefined" && (window as any).gtag_report_conversion) {
+      (window as any).gtag_report_conversion();
+    }
     setPhase("preparing");
     setProgress(5);
 
