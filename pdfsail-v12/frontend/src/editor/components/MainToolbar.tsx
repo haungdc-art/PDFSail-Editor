@@ -154,7 +154,7 @@ export function MainToolbar({
       <button
         onClick={() =>
           addBlock("text", {
-            text: "Edit me",
+            text: t("toolbar.textPlaceholder"),
             fontSize: textFormat.fontSize,
             fontFamily: textFormat.fontFamily,
             color: textFormat.color,
