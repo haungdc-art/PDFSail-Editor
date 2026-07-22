@@ -74,6 +74,8 @@ export function EditableTextNode({
   // 进入编辑模式时聚焦 + 定位光标到双击位置
   useEffect(() => {
     if (!isEditing || !ref.current) return;
+    // 编辑模式下 React 不渲染 children，需要手动设置初始文本
+    ref.current.textContent = segment.text;
     ref.current.focus();
 
     const pos = doubleClickPosRef.current;
@@ -106,6 +108,7 @@ export function EditableTextNode({
     const newText = ref.current?.textContent || "";
     if (newText !== segment.text) {
       onChange(segment.id, newText);
+      setLocalText(newText);
     }
     onEndEdit();
   };
@@ -119,12 +122,6 @@ export function EditableTextNode({
       e.preventDefault();
       setLocalText(segment.text); // 撤销编辑
       ref.current?.blur();
-    }
-  };
-
-  const handleInput = () => {
-    if (ref.current) {
-      setLocalText(ref.current.textContent || "");
     }
   };
 
@@ -203,9 +200,10 @@ export function EditableTextNode({
       }}
       onBlur={handleBlur}
       onKeyDown={handleKeyDown}
-      onInput={handleInput}
     >
-      {localText}
+      {/* 编辑模式下不渲染 React children，避免 re-render 覆盖 contentEditable DOM 导致光标重置。
+          初始文本由 useEffect 通过 ref.current.textContent 设置。 */}
+      {!isEditing && localText}
     </div>
   );
 }
