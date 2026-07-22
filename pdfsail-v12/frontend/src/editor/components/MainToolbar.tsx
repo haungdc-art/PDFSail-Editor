@@ -158,6 +158,7 @@ export function MainToolbar({
             fontSize: textFormat.fontSize,
             fontFamily: textFormat.fontFamily,
             color: textFormat.color,
+            w: 220,
           })
         }
         style={btn}
