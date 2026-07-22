@@ -73,7 +73,8 @@ export function PDFCanvas({
     handleSegmentChange,
   } = useEditor();
 
-  const pageBlocks = docBlocks.filter((b) => b.page === page);
+  // 过滤掉 seg_block_ 前缀的 block（它们是 segment 修改的镜像，只用于导出，不在画布上显示）
+  const pageBlocks = docBlocks.filter((b) => b.page === page && !b.id.startsWith("seg_block_"));
 
   return (
     <>
@@ -180,7 +181,33 @@ export function PDFCanvas({
                       isEditing={editingSegmentId === seg.id}
                       onSelect={() => setEditingSegmentId(null)}
                       onStartEdit={(id: string) => setEditingSegmentId(id)}
-                      onChange={handleSegmentChange}
+                      onChange={(id, newText) => {
+                        // 1. 更新 segments state（即时视觉反馈）
+                        handleSegmentChange(id, newText);
+                        // 2. 同步到 docBlocks 作为 text block（跨页保留 + exportPDF 导出修改后内容）
+                        //    用固定 blockId 便于 upsert，避免重复添加
+                        const blockId = `seg_block_${id}`;
+                        setBlocks((prev) => {
+                          const existingIdx = prev.findIndex((b) => b.id === blockId);
+                          const newBlock = {
+                            id: blockId,
+                            type: "text" as const,
+                            page,
+                            x: seg.cssX,
+                            y: seg.cssY,
+                            w: seg.cssW,
+                            h: seg.cssH,
+                            text: newText,
+                            fontSize: seg.font.size,
+                            fontFamily: seg.font.family,
+                            color: seg.font.color,
+                          };
+                          if (existingIdx >= 0) {
+                            return prev.map((b, i) => (i === existingIdx ? { ...b, text: newText } : b));
+                          }
+                          return [...prev, newBlock];
+                        });
+                      }}
                       onEndEdit={() => setEditingSegmentId(null)}
                     />
                   ))
