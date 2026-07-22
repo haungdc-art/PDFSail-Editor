@@ -178,19 +178,21 @@ function PDFEditorInner() {
         });
       }
       if (dragRef.current) {
+        const drag = dragRef.current; // 捕获到局部变量，避免 updater 延迟执行时 dragRef.current 被 mouseup 置 null
         setDocBlocks((prev) =>
           prev.map((b) =>
-            b.id === dragRef.current!.id
-              ? { ...b, x: dragRef.current!.ox0 + e.clientX - dragRef.current!.ox, y: dragRef.current!.oy0 + e.clientY - dragRef.current!.oy }
+            b.id === drag.id
+              ? { ...b, x: drag.ox0 + e.clientX - drag.ox, y: drag.oy0 + e.clientY - drag.oy }
               : b
           )
         );
       }
       if (resizeRef.current) {
+        const rz = resizeRef.current; // 同上
         setDocBlocks((prev) =>
           prev.map((b) =>
-            b.id === resizeRef.current!.id
-              ? { ...b, w: Math.max(30, resizeRef.current!.initW + e.clientX - resizeRef.current!.startX), h: Math.max(30, resizeRef.current!.initH + e.clientY - resizeRef.current!.startY) }
+            b.id === rz.id
+              ? { ...b, w: Math.max(30, rz.initW + e.clientX - rz.startX), h: Math.max(30, rz.initH + e.clientY - rz.startY) }
               : b,
           )
         );
