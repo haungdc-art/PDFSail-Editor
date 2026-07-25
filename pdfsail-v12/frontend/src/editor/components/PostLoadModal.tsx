@@ -29,6 +29,8 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
       title: t("postload.editText"),
       desc: t("postload.editTextDesc"),
       color: "#3b82f6",
+      credits: 199,
+      price: "$1.99",
       onClick: onEditText,
     },
     {
@@ -36,6 +38,8 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
       title: t("postload.compress"),
       desc: t("postload.compressDesc"),
       color: "#f59e0b",
+      credits: 15,
+      price: "$1.50",
       onClick: onCompress,
     },
     {
@@ -43,6 +47,8 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
       title: t("postload.toWord"),
       desc: t("postload.toWordDesc"),
       color: "#10b981",
+      credits: 199,
+      price: "$1.99",
       onClick: onToWord,
     },
     {
@@ -50,8 +56,16 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
       title: t("postload.toJpg"),
       desc: t("postload.toJpgDesc"),
       color: "#8b5cf6",
+      credits: 199,
+      price: "$1.99",
       onClick: onToJpg,
     },
+  ];
+
+  const perks = [
+    "✓ Preview before payment",
+    "✓ No subscription",
+    "✓ Secure processing",
   ];
 
   return (
@@ -116,7 +130,29 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
               <span style={{ fontSize: 24 }}>{c.icon}</span>
               <span style={{ fontSize: 14, fontWeight: 600, color: "#1e293b" }}>{c.title}</span>
               <span style={{ fontSize: 11, color: "#64748b", lineHeight: 1.4 }}>{c.desc}</span>
+              <span style={{ fontSize: 11, fontWeight: 700, color: c.color, marginTop: 2 }}>
+                {c.credits} Credits ≈ {c.price}
+              </span>
             </button>
+          ))}
+        </div>
+
+        <div
+          style={{
+            marginTop: 16,
+            padding: "12px 16px",
+            background: "#f0fdf4",
+            borderRadius: 8,
+            border: "1px solid #bbf7d0",
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          {perks.map((p) => (
+            <span key={p} style={{ fontSize: 12, color: "#15803d", fontWeight: 600 }}>
+              {p}
+            </span>
           ))}
         </div>
 

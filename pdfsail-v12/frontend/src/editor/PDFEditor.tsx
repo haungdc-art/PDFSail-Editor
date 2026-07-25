@@ -284,8 +284,14 @@ function PDFEditorInner() {
   // OCR / PageOps / Export / Payment / InlineTools migrated to features/ (Commit 3)
 
   const updateSelectedFormat = (patch: Partial<{ fontFamily: string; fontSize: number; color: string }>) => {
-    if (!selectedBlockId) return;
-    setBlocks((prev) => prev.map((b) => b.id === selectedBlockId && b.type === "text" ? { ...b, ...patch } as TextBlock : b));
+    // 编辑文本时（editingBlock 存在），同步更新 editingBlock 的 fontSize
+    if (editingBlock) {
+      setEditingBlock({ ...editingBlock, fontSize: patch.fontSize ?? editingBlock.fontSize });
+    }
+    // 选中了已有 block 时，更新 block 属性
+    if (selectedBlockId) {
+      setBlocks((prev) => prev.map((b) => b.id === selectedBlockId && b.type === "text" ? { ...b, ...patch } as TextBlock : b));
+    }
   };
 
   const addBlock = (type: Block["type"], extra: any = {}) => {

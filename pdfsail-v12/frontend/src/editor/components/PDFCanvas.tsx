@@ -471,8 +471,8 @@ export function PDFCanvas({
             const val = e.currentTarget.value;
             setDocBlocks((prev) => {
               const existing = prev.find((b) => b.id === editingBlock.id);
-              if (existing) return prev.map((b) => b.id === editingBlock.id ? { ...b, text: val, x: editingBlock.x, y: editingBlock.y, fontSize: editingBlock.fontSize, w: editingBlock.w, h: editingBlock.h } as Block : b);
-              return [...prev, { id: editingBlock.id, type: "text", page, x: editingBlock.x, y: editingBlock.y, w: editingBlock.w, h: editingBlock.h, text: val, fontSize: editingBlock.fontSize }];
+              if (existing) return prev.map((b) => b.id === editingBlock.id ? { ...b, text: val, x: editingBlock.x, y: editingBlock.y, fontSize: textFormat.fontSize, fontFamily: textFormat.fontFamily, color: textFormat.color, w: editingBlock.w, h: editingBlock.h } as Block : b);
+              return [...prev, { id: editingBlock.id, type: "text", page, x: editingBlock.x, y: editingBlock.y, w: editingBlock.w, h: editingBlock.h, text: val, fontSize: textFormat.fontSize, fontFamily: textFormat.fontFamily, color: textFormat.color }];
             });
             setEditingBlock(null);
           }}
@@ -485,15 +485,15 @@ export function PDFCanvas({
             left: editingBlock.x - 1,
             top: editingBlock.y - 1,
             width: editingBlock.w,
-            height: editingBlock.h,
-            fontSize: editingBlock.fontSize,
+            height: editingBlock.h - Math.max(0, editingBlock.h - textFormat.fontSize * 1.3),
+            fontSize: textFormat.fontSize,
             lineHeight: 1.3,
             fontFamily: textFormat.fontFamily,
             color: textFormat.color,
             background: "#fff",
             border: "1px solid #3b82f6",
             borderRadius: 4,
-            padding: 0,
+            paddingTop: Math.max(0, editingBlock.h - textFormat.fontSize * 1.3),
             boxSizing: "content-box",
             resize: "none",
             overflow: "hidden",
