@@ -161,7 +161,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       size: String(result.blob.size),
       r2host: R2_FILE_HOST,
     });
-    const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
+    const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
 
     setPhase("done");
     setProgress(100);

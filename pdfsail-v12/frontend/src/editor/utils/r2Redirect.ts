@@ -120,7 +120,7 @@ export async function uploadToR2AndRedirect(
     size: String(blob.size),
     r2host: R2_FILE_HOST,
   });
-  const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
+  const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
   window.location.href = readyUrl;
   return true;
 }
