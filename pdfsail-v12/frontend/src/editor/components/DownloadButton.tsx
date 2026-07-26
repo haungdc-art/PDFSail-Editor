@@ -5,7 +5,7 @@
  *   1. 点击后显示全屏进度条 overlay
  *   2. 调用 handleExport 生成 PDF（不本地下载，拿 blob）
  *   3. 生成 fileKey，上传到 www.pdfsail.com/api/r2-store（Cloudflare R2）
- *   4. 跳转到 https://www.pdfsail.com/[locale]/ready?key=editor/results/xxx.pdf&...
+ *   4. 跳转到 https://www.pdfsail.com/[locale]/paywall?key=editor/results/xxx.pdf&...
  *   5. 上传失败时 fallback 本地下载
  *
  * 跨域说明：
@@ -158,7 +158,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       size: String(result.blob.size),
       r2host: R2_FILE_HOST,
     });
-    const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
+    const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
 
     setPhase("done");
     setProgress(100);

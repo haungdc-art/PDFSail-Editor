@@ -38,8 +38,8 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
       title: t("postload.compress"),
       desc: t("postload.compressDesc"),
       color: "#f59e0b",
-      credits: 15,
-      price: "$1.50",
+      credits: 199,
+      price: "$1.99",
       onClick: onCompress,
     },
     {

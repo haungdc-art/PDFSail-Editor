@@ -2,7 +2,7 @@
  * uploadToR2AndRedirect — 共用 R2 上传 + 跳转 Ready 页
  *
  * 从 DownloadButton.tsx 提取，供 DownloadButton 和 useInlineTools 复用。
- * 流程：生成 token → POST raw body 到 R2 → 跳转 www.pdfsail.com/[locale]/ready
+ * 流程：生成 token → POST raw body 到 R2 → 跳转 www.pdfsail.com/[locale]/paywall
  *
  * 上传失败时 fallback 本地下载。
  */
@@ -107,7 +107,7 @@ export async function uploadToR2AndRedirect(
     size: String(blob.size),
     r2host: R2_FILE_HOST,
   });
-  const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
+  const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
   window.location.href = readyUrl;
   return true;
 }
