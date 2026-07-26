@@ -93,13 +93,16 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     const token = generateFileKey();
     let uploaded = false;
     try {
-      // worker.js L2194-2214：URL 参数带 token/tool/ext，body 是 raw stream
+      // worker.js L6297/L6379：paywall 读取 R2 文件后对前 256 字节做 XOR 0x5A 解码
+      // 所以上传前必须对前 256 字节做 XOR 0x5A 编码，否则 paywall 解码后 PDF 损坏
+      const uploadBlob = await xorEncodeHead(result.blob, 256, 0x5a);
+      // worker.js L4385-4409：URL 参数带 token/tool/ext，body 是 raw stream
       const upResp = await fetch(
         `${R2_STORE_URL}?token=${encodeURIComponent(token)}&tool=editor&ext=pdf`,
         {
           method: "POST",
           headers: { "Content-Type": "application/pdf" },
-          body: result.blob,
+          body: uploadBlob,
         }
       );
       if (upResp.ok) {
@@ -265,4 +268,15 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * 对 Blob 前 headLen 字节做 XOR 编码（匹配 worker.js paywall 端的 XOR 解码）
+ * worker.js L6297: for (let i = 0; i < Math.min(bytes.length, 256); i++) bytes[i] ^= 0x5A;
+ */
+async function xorEncodeHead(blob: Blob, headLen: number, xorKey: number): Promise<Blob> {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const len = Math.min(buf.length, headLen);
+  for (let i = 0; i < len; i++) buf[i] ^= xorKey;
+  return new Blob([buf], { type: blob.type });
 }

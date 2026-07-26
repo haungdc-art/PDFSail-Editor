@@ -26,6 +26,17 @@ function getLocale(): string {
   return "en";
 }
 
+/**
+ * 对 Blob 前 headLen 字节做 XOR 编码（匹配 worker.js paywall 端的 XOR 解码）
+ * worker.js L6297: for (let i = 0; i < Math.min(bytes.length, 256); i++) bytes[i] ^= 0x5A;
+ */
+async function xorEncodeHead(blob: Blob, headLen: number, xorKey: number): Promise<Blob> {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const len = Math.min(buf.length, headLen);
+  for (let i = 0; i < len; i++) buf[i] ^= xorKey;
+  return new Blob([buf], { type: blob.type });
+}
+
 /** 从文件名提取扩展名（不含点号），如 "compressed.pdf" → "pdf" */
 function getExt(fileName: string): string {
   const parts = fileName.split(".");
@@ -58,12 +69,14 @@ export async function uploadToR2AndRedirect(
   // 上传到 R2
   let uploaded = false;
   try {
+    // worker.js paywall 端对前 256 字节做 XOR 0x5A 解码，上传前必须编码
+    const uploadBlob = await xorEncodeHead(blob, 256, 0x5a);
     const upResp = await fetch(
       `${R2_STORE_URL}?token=${encodeURIComponent(token)}&tool=editor&ext=${ext}`,
       {
         method: "POST",
         headers: { "Content-Type": contentType },
-        body: blob,
+        body: uploadBlob,
       }
     );
     if (upResp.ok) {
