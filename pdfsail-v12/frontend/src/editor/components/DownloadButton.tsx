@@ -140,7 +140,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       return;
     }
 
-    // 阶段 3：跳转到 ready 页面（worker.js 注入 R2 读取脚本生成缩略图）
+    // 阶段 3：跳转到 paywall 页面
     setPhase("redirecting");
     for (let p = 85; p <= 95; p += 5) {
       setProgress(p);
@@ -148,11 +148,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     }
 
     const locale = lang === "pt" ? "pt" : "en";
-
-    // 跳转到 /ready（不是 /paywall）：worker.js 对 /ready 路径注入 R2 读取脚本，
-    // 服务端读取 R2 + XOR 解码 + base64 内联 → 浏览器存 IndexedDB → ready 页面生成缩略图存 sessionStorage
-    // ready 页面显示"下载"按钮 → 用户点击 → 跳到 /paywall → paywall 从 sessionStorage 读取缩略图
-    // 注意：不能直接跳 /paywall，因为跨域 sessionStorage 不共享（edit.pdfsail.com → www.pdfsail.com）
+    // 跳转到 /paywall：paywall 页面自己从 R2 获取 PDF 生成缩略图（不经过 /ready）
     const stripPdfExt = (s: string) => s.toLowerCase().endsWith(".pdf") ? s.slice(0, -4) : s;
     const params = new URLSearchParams({
       key: token,
@@ -163,7 +159,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       size: String(result.blob.size),
       r2host: R2_FILE_HOST,
     });
-    const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
+    const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
 
     setPhase("done");
     setProgress(100);

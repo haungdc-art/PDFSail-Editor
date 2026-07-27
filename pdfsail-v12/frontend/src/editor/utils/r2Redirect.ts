@@ -103,9 +103,7 @@ export async function uploadToR2AndRedirect(
     return false;
   }
 
-  // 跳转到 ready 页（不能直接跳 paywall，跨域 sessionStorage 不共享）
-  // worker.js 对 /ready 路径注入 R2 读取脚本 → 生成缩略图存 sessionStorage
-  // ready 页面 → 用户点下载 → 跳到 /paywall → paywall 从 sessionStorage 读取缩略图
+  // 跳转到 paywall 页（paywall 自己从 R2 获取 PDF 生成缩略图）
   const locale = getLocale();
 
   const stripExt = (s: string) => {
@@ -121,7 +119,7 @@ export async function uploadToR2AndRedirect(
     size: String(blob.size),
     r2host: R2_FILE_HOST,
   });
-  const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
+  const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
   window.location.href = readyUrl;
   return true;
 }
