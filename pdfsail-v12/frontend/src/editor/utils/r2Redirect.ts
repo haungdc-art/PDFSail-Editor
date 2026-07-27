@@ -37,24 +37,6 @@ async function xorEncodeHead(blob: Blob, headLen: number, xorKey: number): Promi
   return new Blob([buf], { type: blob.type });
 }
 
-/**
- * 用 pdf.js 渲染 PDF 第一页为缩略图（base64 JPEG dataURL）
- * paywall 页面从 sessionStorage.getItem('sail_pdf_thumbnail') 读取
- */
-async function generateThumbnail(blob: Blob): Promise<string> {
-  const pdfjsLib = await import("pdfjs-dist");
-  const buf = await blob.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
-  const page = await pdf.getPage(1);
-  const viewport = page.getViewport({ scale: 0.5 });
-  const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  const ctx = canvas.getContext("2d")!;
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL("image/jpeg", 0.7);
-}
-
 /** 从文件名提取扩展名（不含点号），如 "compressed.pdf" → "pdf" */
 function getExt(fileName: string): string {
   const parts = fileName.split(".");
@@ -121,25 +103,11 @@ export async function uploadToR2AndRedirect(
     return false;
   }
 
-  // 跳转到 paywall 页
+  // 跳转到 ready 页（不能直接跳 paywall，跨域 sessionStorage 不共享）
+  // worker.js 对 /ready 路径注入 R2 读取脚本 → 生成缩略图存 sessionStorage
+  // ready 页面 → 用户点下载 → 跳到 /paywall → paywall 从 sessionStorage 读取缩略图
   const locale = getLocale();
 
-  // paywall 页面从 sessionStorage 读取缩略图，跳转前生成并存入
-  // 仅 PDF 文件生成缩略图（图片/zip 等跳过）
-  if (ext === "pdf") {
-    try {
-      const thumbnail = await generateThumbnail(blob);
-      sessionStorage.setItem("sail_pdf_thumbnail", thumbnail);
-      sessionStorage.setItem("sail_ready_key", token);
-      sessionStorage.setItem("sail_ready_name", fileName);
-      sessionStorage.setItem("sail_ready_size", String(blob.size));
-    } catch (e) {
-      console.warn("Thumbnail generation failed:", e);
-    }
-  }
-
-  // Ready 页面会把 key/r2 当作纯 token 拼接成 `editor/results/${key}.${ext}`
-  // 所以传纯 token，name 也不带扩展名（Ready 页面会拼接）
   const stripExt = (s: string) => {
     const dot = s.lastIndexOf(".");
     return dot > 0 ? s.slice(0, dot) : s;
@@ -153,7 +121,7 @@ export async function uploadToR2AndRedirect(
     size: String(blob.size),
     r2host: R2_FILE_HOST,
   });
-  const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
+  const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
   window.location.href = readyUrl;
   return true;
 }

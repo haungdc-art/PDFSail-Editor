@@ -17,7 +17,6 @@
 
 import { useState } from "react";
 import { createPortal } from "react-dom";
-import * as pdfjsLib from "pdfjs-dist";
 import { useI18n } from "../../i18n/I18nProvider";
 import type { ExportResult } from "../features/useExport";
 
@@ -141,7 +140,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       return;
     }
 
-    // 阶段 3：生成缩略图 + 跳转到 paywall 页面
+    // 阶段 3：跳转到 ready 页面（worker.js 注入 R2 读取脚本生成缩略图）
     setPhase("redirecting");
     for (let p = 85; p <= 95; p += 5) {
       setProgress(p);
@@ -150,21 +149,10 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
 
     const locale = lang === "pt" ? "pt" : "en";
 
-    // paywall 页面从 sessionStorage 读取缩略图（base64 dataURL）和文件信息
-    // 所以上传后需要生成缩略图存入 sessionStorage，否则 paywall 缩略图区域空白
-    try {
-      const thumbnail = await generateThumbnail(result.blob);
-      sessionStorage.setItem("sail_pdf_thumbnail", thumbnail);
-      sessionStorage.setItem("sail_ready_key", token);
-      sessionStorage.setItem("sail_ready_name", result.fileName);
-      sessionStorage.setItem("sail_ready_size", String(result.blob.size));
-    } catch (e) {
-      console.warn("Thumbnail generation failed:", e);
-    }
-
-    // Ready 页面会把 key/r2 当作纯 token 重新拼接成 `editor/results/${key}.pdf`
-    // 所以这里必须传纯 token（不含 editor/results/ 前缀和 .pdf 后缀），避免双重拼接
-    // 同理 name 也不能带 .pdf 后缀（Ready 页面会拼接 .pdf）
+    // 跳转到 /ready（不是 /paywall）：worker.js 对 /ready 路径注入 R2 读取脚本，
+    // 服务端读取 R2 + XOR 解码 + base64 内联 → 浏览器存 IndexedDB → ready 页面生成缩略图存 sessionStorage
+    // ready 页面显示"下载"按钮 → 用户点击 → 跳到 /paywall → paywall 从 sessionStorage 读取缩略图
+    // 注意：不能直接跳 /paywall，因为跨域 sessionStorage 不共享（edit.pdfsail.com → www.pdfsail.com）
     const stripPdfExt = (s: string) => s.toLowerCase().endsWith(".pdf") ? s.slice(0, -4) : s;
     const params = new URLSearchParams({
       key: token,
@@ -175,7 +163,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       size: String(result.blob.size),
       r2host: R2_FILE_HOST,
     });
-    const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
+    const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
 
     setPhase("done");
     setProgress(100);
@@ -293,21 +281,4 @@ async function xorEncodeHead(blob: Blob, headLen: number, xorKey: number): Promi
   const len = Math.min(buf.length, headLen);
   for (let i = 0; i < len; i++) buf[i] ^= xorKey;
   return new Blob([buf], { type: blob.type });
-}
-
-/**
- * 用 pdf.js 渲染 PDF 第一页为缩略图（base64 JPEG dataURL）
- * paywall 页面从 sessionStorage.getItem('sail_pdf_thumbnail') 读取
- */
-async function generateThumbnail(blob: Blob): Promise<string> {
-  const buf = await blob.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: buf.slice(0) }).promise;
-  const page = await pdf.getPage(1);
-  const viewport = page.getViewport({ scale: 0.5 });
-  const canvas = document.createElement("canvas");
-  canvas.width = viewport.width;
-  canvas.height = viewport.height;
-  const ctx = canvas.getContext("2d")!;
-  await page.render({ canvasContext: ctx, viewport }).promise;
-  return canvas.toDataURL("image/jpeg", 0.7);
 }
