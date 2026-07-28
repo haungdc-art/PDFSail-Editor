@@ -148,18 +148,17 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     }
 
     const locale = lang === "pt" ? "pt" : "en";
-    // 跳转到 /ready 页：worker.js L6263 拦截 /ready 路由，从 R2 读取 PDF → XOR 解码
-    // → 注入 bridge script 写入 IndexedDB（同域 www.pdfsail.com）→ 主站 /ready 页生成缩略图
-    // 并跳转 /paywall。直接跳 /paywall 会导致跨域 sessionStorage/IndexedDB 不可用，缩略图不显示。
-    const stripPdfExt = (s: string) => s.toLowerCase().endsWith(".pdf") ? s.slice(0, -4) : s;
+    // 跳转到 /ready 页：worker.js 拦截 /ready 路由，从 R2 读取 PDF（XOR 编码）
+    // → 注入 bridge script 写入 IndexedDB（同域 www.pdfsail.com，保持 XOR 编码）
+    // → 主站 /ready 页读取 IndexedDB → xorDecrypt 解码 → 生成缩略图 + 下载按钮
+    // 不传 r2 参数：强制走 IndexedDB 路径（/ready 页 R2 URL 路径的 key 前缀不匹配 editor/）
+    // name 带扩展名：让 /ready 页正确判断文件类型
     const params = new URLSearchParams({
       key: token,
-      r2: token,
       tool: "editor",
       task: "edit",
-      name: stripPdfExt(result.fileName),
+      name: result.fileName,
       size: String(result.blob.size),
-      r2host: R2_FILE_HOST,
     });
     const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
 
