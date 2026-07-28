@@ -5,7 +5,7 @@
  *   1. 点击后显示全屏进度条 overlay
  *   2. 调用 handleExport 生成 PDF（不本地下载，拿 blob）
  *   3. 生成 fileKey，上传到 www.pdfsail.com/api/r2-store（Cloudflare R2）
- *   4. 跳转到 https://www.pdfsail.com/[locale]/paywall?key=editor/results/xxx.pdf&...
+ *   4. 跳转到 https://www.pdfsail.com/[locale]/ready?key=...&tool=editor&...（/ready 页写入 IndexedDB 后跳转 /paywall）
  *   5. 上传失败时 fallback 本地下载
  *
  * 跨域说明：
@@ -148,7 +148,9 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     }
 
     const locale = lang === "pt" ? "pt" : "en";
-    // 跳转到 /paywall：paywall 页面自己从 R2 获取 PDF 生成缩略图（不经过 /ready）
+    // 跳转到 /ready 页：worker.js L6263 拦截 /ready 路由，从 R2 读取 PDF → XOR 解码
+    // → 注入 bridge script 写入 IndexedDB（同域 www.pdfsail.com）→ 主站 /ready 页生成缩略图
+    // 并跳转 /paywall。直接跳 /paywall 会导致跨域 sessionStorage/IndexedDB 不可用，缩略图不显示。
     const stripPdfExt = (s: string) => s.toLowerCase().endsWith(".pdf") ? s.slice(0, -4) : s;
     const params = new URLSearchParams({
       key: token,
@@ -159,7 +161,7 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       size: String(result.blob.size),
       r2host: R2_FILE_HOST,
     });
-    const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
+    const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
 
     setPhase("done");
     setProgress(100);

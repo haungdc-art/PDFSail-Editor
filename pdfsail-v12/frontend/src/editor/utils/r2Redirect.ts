@@ -2,7 +2,7 @@
  * uploadToR2AndRedirect — 共用 R2 上传 + 跳转 Ready 页
  *
  * 从 DownloadButton.tsx 提取，供 DownloadButton 和 useInlineTools 复用。
- * 流程：生成 token → POST raw body 到 R2 → 跳转 www.pdfsail.com/[locale]/paywall
+ * 流程：生成 token → POST raw body 到 R2 → 跳转 www.pdfsail.com/[locale]/ready（/ready 页写入 IndexedDB 后跳转 /paywall）
  *
  * 上传失败时 fallback 本地下载。
  */
@@ -103,7 +103,9 @@ export async function uploadToR2AndRedirect(
     return false;
   }
 
-  // 跳转到 paywall 页（paywall 自己从 R2 获取 PDF 生成缩略图）
+  // 跳转到 /ready 页：worker.js L6263 拦截 /ready 路由，从 R2 读取 PDF → XOR 解码
+  // → 注入 bridge script 写入 IndexedDB（同域 www.pdfsail.com）→ 主站 /ready 页生成缩略图
+  // 并跳转 /paywall。直接跳 /paywall 会导致跨域 sessionStorage/IndexedDB 不可用，缩略图不显示。
   const locale = getLocale();
 
   const stripExt = (s: string) => {
@@ -119,7 +121,7 @@ export async function uploadToR2AndRedirect(
     size: String(blob.size),
     r2host: R2_FILE_HOST,
   });
-  const readyUrl = `${READY_BASE}/${locale}/paywall?${params.toString()}`;
+  const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
   window.location.href = readyUrl;
   return true;
 }
