@@ -38,6 +38,17 @@ export function useOperationState() {
   });
   const [compressQuality, setCompressQuality] = useState<import("../../compress/compress-core").CompressQuality>("ebook");
 
+  // 完成弹框：工具处理完成后展示
+  const [completionResult, setCompletionResult] = useState<{
+    tool: string;
+    fileName: string;
+    originalSize: number;
+    resultSize: number;
+    savings?: number;
+    info?: string;
+    blob: Blob;
+  } | null>(null);
+
   return {
     // 处理状态
     processingTool,
@@ -70,6 +81,9 @@ export function useOperationState() {
     setPageNumOpts,
     compressQuality,
     setCompressQuality,
+    // 完成弹框
+    completionResult,
+    setCompletionResult,
   };
 }
 

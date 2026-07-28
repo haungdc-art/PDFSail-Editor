@@ -89,17 +89,9 @@ export async function uploadToR2AndRedirect(
   }
 
   if (!uploaded) {
-    // fallback：本地下载
-    try {
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = fileName;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      console.error("Local download fallback failed:", e);
-    }
+    // 上传失败：不允许本地下载，必须走付费流程
+    console.error("R2 upload failed — cannot proceed to /ready without upload");
+    alert("Upload failed. Please check your network and try again.");
     return false;
   }
 

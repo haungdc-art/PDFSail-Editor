@@ -15,7 +15,6 @@ import { useCallback } from "react";
 import { useEditor } from "../core/EditorProvider";
 import { exportPDF } from "../export-pdf";
 import type { LockCoordSystem } from "../coord";
-import { uploadToR2AndRedirect } from "../utils/r2Redirect";
 // Inline tool imports
 import { compressPDF, type CompressQuality } from "../../compress/compress-core";
 import { splitPDF } from "../../split/split-core";
@@ -43,6 +42,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
     setWsActionsDone,
     setWsShowFlow,
     setWsAction,
+    setCompletionResult,
   } = useEditor();
 
   const addLog = useCallback((msg: string) => {
@@ -68,6 +68,8 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
     try {
       let result: Uint8Array | Blob | null = null;
       let fileName = "";
+      let info = "";
+      let savingsPct: number | undefined;
 
       switch (tool) {
         case "compress": {
@@ -78,6 +80,8 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           });
           result = new Uint8Array(r.compressed);
           fileName = `compressed_${r.savings}pct.pdf`;
+          savingsPct = r.savings;
+          info = `Mode: ${r.mode}`;
           addLog(`Compressed: ${(r.originalSize / 1024).toFixed(0)}KB → ${(r.compressedSize / 1024).toFixed(0)}KB (${r.savings}% saved, ${r.mode})`);
           break;
         }
@@ -100,6 +104,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
             fileName = `split_merged.pdf`;
           }
           addLog(`Split: ${r.totalPages} pages into ${r.pages.length} file(s).`);
+          info = `${r.pages.length} file(s) from ${r.totalPages} pages`;
           break;
         }
         case "rotate": {
@@ -107,6 +112,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           const r = await rotatePDF(sourceBytes, extra.degrees as any, extra.mode as any, extra.pageIndex || 0);
           result = new Uint8Array(r);
           fileName = `rotated_${extra.degrees}.pdf`;
+          info = `Rotated ${extra.degrees}°`;
           addLog(`Rotation complete.`);
           break;
         }
@@ -115,6 +121,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           const r = await addPageNumbers(sourceBytes, extra.opts);
           result = new Uint8Array(r);
           fileName = `numbered.pdf`;
+          info = `Page numbers added to ${totalPages} pages`;
           addLog(`Page numbers added to ${totalPages} pages.`);
           break;
         }
@@ -123,6 +130,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           const r = await convertPdfToDocx(sourceBytes);
           result = r.blob;
           fileName = `converted.docx`;
+          info = `Quality: ${(r.quality * 100).toFixed(0)}%`;
           addLog(`Conversion complete (quality: ${(r.quality * 100).toFixed(0)}%).`);
           if (r.paywall !== "free") addLog(`⚠ ${r.paywall} tier — price: $${r.price}`);
           break;
@@ -132,6 +140,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           const r = await convertPdfToExcel(sourceBytes);
           result = r.blob;
           fileName = `converted.xlsx`;
+          info = `${r.rowCount} rows × ${r.colCount} cols`;
           addLog(`Converted: ${r.rowCount} rows × ${r.colCount} cols (confidence: ${(r.tableConfidence * 100).toFixed(0)}%).`);
           if (r.paywall !== "free") addLog(`⚠ ${r.paywall} tier — price: $${r.price}`);
           break;
@@ -141,6 +150,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           const r = await removeWatermark(sourceBytes);
           result = r.blob;
           fileName = `cleaned.pdf`;
+          info = `Removed ${r.removed} watermark(s)`;
           addLog(`Removed ${r.removed} watermark(s) across ${r.pagesAffected} pages.`);
           addLog(`Intent: ${r.intent} | Confidence: ${(r.confidence * 100).toFixed(0)}%`);
           if (r.paywall !== "free") addLog(`⚠ ${r.paywall} tier — price: $${r.price}`);
@@ -150,7 +160,6 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
           addLog(`Converting PDF to JPG images...`);
           const r = await convertPdfToJpg(sourceBytes, { scale: 2, quality: 0.92 });
           addLog(`Rendered ${r.count} page(s) to JPG.`);
-          // 多页：把所有 JPG 合并成一个 PDF 上传到 R2
           if (r.blobs.length === 1) {
             result = r.blobs[0].blob;
             fileName = `page_${r.blobs[0].index + 1}.jpg`;
@@ -166,16 +175,24 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
             result = new Uint8Array(await merged.save());
             fileName = `pdf_to_jpg.pdf`;
           }
+          info = `${r.count} page(s) to JPG`;
           break;
         }
       }
 
       if (result) {
-        addLog(`✅ ${tool} complete. Uploading to PDFSail...`);
+        addLog(`✅ ${tool} complete.`);
         const blob = result instanceof Blob ? result : new Blob([result as BlobPart], { type: "application/octet-stream" });
-        addLog(`Redirecting to checkout...`);
-        // 上传到 R2 + 跳转 Ready 页（付费下载），失败时 fallback 本地下载
-        await uploadToR2AndRedirect(blob, fileName, tool);
+        // 不自动跳转：弹完成弹框，用户点 Download 才上传 R2 + 跳转 /ready
+        setCompletionResult({
+          tool,
+          fileName,
+          originalSize: sourceBytes.length,
+          resultSize: blob.size,
+          savings: savingsPct,
+          info,
+          blob,
+        });
       }
       // Update workspace state
       if (workspaceMode) {
@@ -188,7 +205,7 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
     } finally {
       setTimeout(() => setProcessingTool(null), 1500);
     }
-  }, [docBlocks, pdfDoc, pdfBytesRef, coordRef, totalPages, workspaceMode, addLog, setProcessingTool, setProcessingLog, setWsActionsDone, setWsShowFlow, setWsAction]);
+  }, [docBlocks, pdfDoc, pdfBytesRef, coordRef, totalPages, workspaceMode, addLog, setProcessingTool, setProcessingLog, setWsActionsDone, setWsShowFlow, setWsAction, setCompletionResult]);
 
   return { processInline };
 }

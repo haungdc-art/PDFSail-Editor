@@ -71,6 +71,16 @@ export interface OperationState {
     color: string;
   };
   compressQuality: import("../../compress/compress-core").CompressQuality;
+  // 完成弹框：工具处理完成后展示，用户点 Download 才跳转 /ready
+  completionResult: {
+    tool: string;
+    fileName: string;
+    originalSize: number;
+    resultSize: number;
+    savings?: number;
+    info?: string;
+    blob: Blob;
+  } | null;
 }
 
 // ═══════════════════════════════════════════════════════════════════

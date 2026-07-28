@@ -18,6 +18,7 @@
 import { useState } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../../i18n/I18nProvider";
+import { useEditor } from "../core/EditorProvider";
 import type { ExportResult } from "../features/useExport";
 
 interface DownloadButtonProps {
@@ -33,6 +34,7 @@ const READY_BASE = "https://www.pdfsail.com";
 
 export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) {
   const { lang } = useI18n();
+  const { setCompletionResult } = useEditor();
   const [phase, setPhase] = useState<Phase>("idle");
   const [progress, setProgress] = useState(0);
 
@@ -62,19 +64,16 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
 
   const start = async () => {
     if (disabled || phase !== "idle") return;
-    // 上报 Google Ads 转化（用户点击 Download 按钮时触发）
     if (typeof window !== "undefined" && (window as any).gtag_report_conversion) {
       (window as any).gtag_report_conversion();
     }
     setPhase("preparing");
     setProgress(5);
 
-    // 阶段 1：生成 PDF blob（不本地下载）
     let result: ExportResult | null;
     try {
       result = await handleExport(true, false);
       if (!result) {
-        // 支付弹窗打开或导出失败
         setPhase("idle");
         setProgress(0);
         return;
@@ -86,86 +85,20 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
       return;
     }
 
-    setProgress(25);
-
-    // 阶段 2：上传到 R2（www.pdfsail.com/api/r2-store，raw body + URL 参数）
-    setPhase("uploading");
-    const token = generateFileKey();
-    let uploaded = false;
-    try {
-      // worker.js L6297/L6379：paywall 读取 R2 文件后对前 256 字节做 XOR 0x5A 解码
-      // 所以上传前必须对前 256 字节做 XOR 0x5A 编码，否则 paywall 解码后 PDF 损坏
-      const uploadBlob = await xorEncodeHead(result.blob, 256, 0x5a);
-      // worker.js L4385-4409：URL 参数带 token/tool/ext，body 是 raw stream
-      const upResp = await fetch(
-        `${R2_STORE_URL}?token=${encodeURIComponent(token)}&tool=editor&ext=pdf`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/pdf" },
-          body: uploadBlob,
-        }
-      );
-      if (upResp.ok) {
-        uploaded = true;
-      } else {
-        console.warn("R2 upload failed:", upResp.status, await upResp.text().catch(() => ""));
-      }
-    } catch (e) {
-      console.warn("R2 upload error (likely CORS or network):", e);
-    }
-
-    // 模拟上传进度动画
-    for (let p = 35; p <= 80; p += 5) {
-      setProgress(p);
-      await sleep(80);
-    }
-
-    if (!uploaded) {
-      // fallback：本地下载
-      setPhase("error");
-      setProgress(90);
-      try {
-        const url = URL.createObjectURL(result.blob);
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = result.fileName;
-        a.click();
-        URL.revokeObjectURL(url);
-      } catch (e) {
-        console.error("Local download fallback failed:", e);
-      }
-      await sleep(1500);
-      setPhase("idle");
-      setProgress(0);
-      return;
-    }
-
-    // 阶段 3：跳转到 paywall 页面
-    setPhase("redirecting");
-    for (let p = 85; p <= 95; p += 5) {
-      setProgress(p);
-      await sleep(100);
-    }
-
-    const locale = lang === "pt" ? "pt" : "en";
-    // 跳转到 /ready 页：worker.js 拦截 /ready 路由，从 R2 读取 PDF（XOR 编码）
-    // → 注入 bridge script 写入 IndexedDB（同域 www.pdfsail.com，保持 XOR 编码）
-    // → 主站 /ready 页读取 IndexedDB → xorDecrypt 解码 → 生成缩略图 + 下载按钮
-    // 不传 r2 参数：强制走 IndexedDB 路径（/ready 页 R2 URL 路径的 key 前缀不匹配 editor/）
-    // name 带扩展名：让 /ready 页正确判断文件类型
-    const params = new URLSearchParams({
-      key: token,
-      tool: "editor",
-      task: "edit",
-      name: result.fileName,
-      size: String(result.blob.size),
-    });
-    const readyUrl = `${READY_BASE}/${locale}/ready?${params.toString()}`;
-
-    setPhase("done");
     setProgress(100);
+    setPhase("done");
     await sleep(400);
-    window.location.href = readyUrl;
+
+    // 弹完成弹框：用户点 Download 才上传 R2 + 跳转 /ready
+    setCompletionResult({
+      tool: "edit",
+      fileName: result.fileName,
+      originalSize: result.blob.size,
+      resultSize: result.blob.size,
+      blob: result.blob,
+    });
+    setPhase("idle");
+    setProgress(0);
   };
 
   if (phase === "idle") {

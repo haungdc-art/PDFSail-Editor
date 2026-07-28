@@ -151,6 +151,8 @@ export function MainToolbar({
         </button>
       )}
       <div style={sep} />
+      {/* 未加载文件时禁用所有编辑按钮 */}
+      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap", opacity: pdfDoc ? 1 : 0.35, pointerEvents: pdfDoc ? "auto" : "none" }}>
       <button
         onClick={() =>
           addBlock("text", {
@@ -351,6 +353,7 @@ export function MainToolbar({
       >
         {t("toolbar.clear")}
       </button>
+      </div>
       {pdfDoc && (
         <span style={{ fontSize: 12, color: "#94a3b8", marginLeft: 4 }}>
           {fileName} — p.{page}/{totalPages}

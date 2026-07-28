@@ -8,12 +8,14 @@
  *   - addBlock / handleStripePay / handlePaypalPay / processInline
  */
 
+import { useState } from "react";
 import { useEditor } from "../core/EditorProvider";
 import { Modal } from "./Modal";
 import SignaturePad from "../SignaturePad";
 import type { Block } from "../types";
 import type { CompressQuality } from "../../compress/compress-core";
 import { useI18n } from "../../i18n/I18nProvider";
+import { uploadToR2AndRedirect } from "../utils/r2Redirect";
 
 interface OptionModalsProps {
   addBlock: (type: Block["type"], extra?: any) => void;
@@ -86,8 +88,12 @@ export function OptionModals({
     setShowPageNumOptions,
     pageNumOpts,
     setPageNumOpts,
+    // 完成弹框
+    completionResult,
+    setCompletionResult,
   } = useEditor();
   const { t } = useI18n();
+  const [downloading, setDownloading] = useState(false);
 
   return (
     <>
@@ -820,6 +826,80 @@ export function OptionModals({
             }}
           >
             {t("modal.addNumbers")}
+          </button>
+        </Modal>
+      )}
+
+      {/* ── Completion Modal ── */}
+      {completionResult && (
+        <Modal title={t("modal.completionTitle")} onClose={() => !downloading && setCompletionResult(null)}>
+          <div style={{ textAlign: "center", marginBottom: 16 }}>
+            <div style={{
+              width: 56, height: 56, borderRadius: "50%",
+              background: "#dcfce7", margin: "0 auto 12px",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 28, color: "#16a34a",
+            }}>
+              ✓
+            </div>
+            <div style={{ fontSize: 14, color: "#1e293b", fontWeight: 600, marginBottom: 4 }}>
+              {t("modal.completionReady")}
+            </div>
+            <div style={{ fontSize: 12, color: "#64748b" }}>{completionResult.info}</div>
+          </div>
+
+          <div style={{
+            display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16,
+            padding: "10px 12px", background: "#f8fafc", borderRadius: 8,
+          }}>
+            <div>
+              <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 2 }}>{t("modal.completionFile")}</div>
+              <div style={{ fontSize: 12, color: "#1e293b", fontWeight: 500, wordBreak: "break-all" }}>
+                {completionResult.fileName}
+              </div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, color: "#94a3b8", marginBottom: 2 }}>{t("modal.completionSize")}</div>
+              <div style={{ fontSize: 12, color: "#1e293b", fontWeight: 500 }}>
+                {(completionResult.originalSize / 1024).toFixed(0)}KB
+                {completionResult.resultSize !== completionResult.originalSize && (
+                  <> → {(completionResult.resultSize / 1024).toFixed(0)}KB</>
+                )}
+              </div>
+              {completionResult.savings !== undefined && completionResult.savings > 0 && (
+                <div style={{ fontSize: 11, color: "#16a34a", fontWeight: 600 }}>
+                  −{completionResult.savings}% saved
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div style={{
+            fontSize: 11, color: "#64748b", lineHeight: 1.5, marginBottom: 16,
+            padding: "8px 12px", background: "#fffbeb", borderRadius: 6, border: "1px solid #fef3c7",
+          }}>
+            {t("modal.completionHint")}
+          </div>
+
+          <button
+            onClick={async () => {
+              if (downloading) return;
+              setDownloading(true);
+              try {
+                await uploadToR2AndRedirect(completionResult.blob, completionResult.fileName, completionResult.tool);
+              } catch (e) {
+                console.error("Download redirect failed:", e);
+                setDownloading(false);
+              }
+            }}
+            disabled={downloading}
+            style={{
+              width: "100%", padding: "12px", border: "none", borderRadius: 8,
+              background: downloading ? "#94a3b8" : "linear-gradient(135deg,#10b981,#059669)",
+              color: "#fff", fontSize: 14, fontWeight: 600, cursor: downloading ? "wait" : "pointer",
+            }}
+          >
+            {downloading ? t("modal.completionUploading") : t("modal.completionDownload")}
           </button>
         </Modal>
       )}
