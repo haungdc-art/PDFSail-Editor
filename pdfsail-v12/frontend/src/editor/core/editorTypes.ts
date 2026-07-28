@@ -70,7 +70,7 @@ export interface OperationState {
     fontSize: number;
     color: string;
   };
-  compressQuality: number;
+  compressQuality: import("../../compress/compress-core").CompressQuality;
 }
 
 // ═══════════════════════════════════════════════════════════════════

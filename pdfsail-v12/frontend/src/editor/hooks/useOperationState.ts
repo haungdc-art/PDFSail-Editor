@@ -36,7 +36,7 @@ export function useOperationState() {
     fontSize: 12,
     color: "#333333",
   });
-  const [compressQuality, setCompressQuality] = useState(60);
+  const [compressQuality, setCompressQuality] = useState<import("../../compress/compress-core").CompressQuality>("ebook");
 
   return {
     // 处理状态

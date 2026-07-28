@@ -12,6 +12,7 @@ import { useEditor } from "../core/EditorProvider";
 import { Modal } from "./Modal";
 import SignaturePad from "../SignaturePad";
 import type { Block } from "../types";
+import type { CompressQuality } from "../../compress/compress-core";
 import { useI18n } from "../../i18n/I18nProvider";
 
 interface OptionModalsProps {
@@ -351,36 +352,52 @@ export function OptionModals({
       {/* ── Compress Options Modal ── */}
       {showCompressOptions && (
         <Modal title={t("modal.compressTitle")} onClose={() => setShowCompressOptions(false)}>
-          <label
-            style={{
-              fontSize: 12,
-              color: "#64748b",
-              display: "block",
-              marginBottom: 4,
-            }}
-          >
-            {t("modal.imageQuality")}: {compressQuality}%
-          </label>
-          <input
-            type="range"
-            min={10}
-            max={100}
-            value={compressQuality}
-            onChange={(e) => setCompressQuality(Number(e.target.value))}
-            style={{ width: "100%", marginBottom: 12 }}
-          />
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              fontSize: 11,
-              color: "#94a3b8",
-              marginBottom: 16,
-            }}
-          >
-            <span>{t("modal.smallerSize")}</span>
-            <span>{t("modal.betterQuality")}</span>
-          </div>
+          {(() => {
+            const levels: { id: CompressQuality; title: string; desc: string; accent: string; recommended?: boolean }[] = [
+              { id: "printer", title: t("modal.compressLow"), desc: t("modal.compressLowDesc"), accent: "#38bdf8" },
+              { id: "ebook", title: t("modal.compressMedium"), desc: t("modal.compressMediumDesc"), accent: "#a78bfa", recommended: true },
+              { id: "screen", title: t("modal.compressHigh"), desc: t("modal.compressHighDesc"), accent: "#34d399" },
+            ];
+            return (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 16 }}>
+                {levels.map((opt) => {
+                  const selected = compressQuality === opt.id;
+                  return (
+                    <button
+                      key={opt.id}
+                      onClick={() => setCompressQuality(opt.id)}
+                      style={{
+                        position: "relative",
+                        textAlign: "left",
+                        padding: "12px 10px",
+                        borderRadius: 10,
+                        border: selected ? `2px solid ${opt.accent}` : "2px solid #e2e8f0",
+                        background: selected ? `${opt.accent}0d` : "#fff",
+                        cursor: "pointer",
+                        transition: "all 0.15s",
+                      }}
+                    >
+                      {opt.recommended && (
+                        <span style={{
+                          position: "absolute", top: -8, right: 8,
+                          fontSize: 9, fontWeight: 700, color: "#fff",
+                          background: opt.accent, padding: "2px 6px", borderRadius: 999,
+                        }}>
+                          ★
+                        </span>
+                      )}
+                      <div style={{ fontSize: 13, fontWeight: 700, color: selected ? opt.accent : "#1e293b", marginBottom: 2 }}>
+                        {opt.title}
+                      </div>
+                      <div style={{ fontSize: 10, color: "#64748b", lineHeight: 1.4 }}>
+                        {opt.desc}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            );
+          })()}
           <div
             style={{
               fontSize: 12,
@@ -393,8 +410,6 @@ export function OptionModals({
             }}
           >
             {t("modal.compressHint")}
-            <br />
-            {t("modal.compressHint2")}
           </div>
           <button
             onClick={() => {

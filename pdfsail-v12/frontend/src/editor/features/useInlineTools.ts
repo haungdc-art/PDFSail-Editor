@@ -17,7 +17,7 @@ import { exportPDF } from "../export-pdf";
 import type { LockCoordSystem } from "../coord";
 import { uploadToR2AndRedirect } from "../utils/r2Redirect";
 // Inline tool imports
-import { compressPDF } from "../../compress/compress-core";
+import { compressPDF, type CompressQuality } from "../../compress/compress-core";
 import { splitPDF } from "../../split/split-core";
 import { rotatePDF } from "../../rotate/rotate-core";
 import { addPageNumbers } from "../../pagenum/pagenum-core";
@@ -71,11 +71,14 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
 
       switch (tool) {
         case "compress": {
-          addLog(`Compressing PDF (quality: ${extra.quality || 60})...`);
-          const r = await compressPDF(sourceBytes, extra.quality || 60);
-          result = new Uint8Array(r.bytes);
-          fileName = `compressed_${r.ratio.toFixed(0)}pct.pdf`;
-          addLog(`Compressed: ${(r.originalSize / 1024).toFixed(0)}KB → ${(r.compressedSize / 1024).toFixed(0)}KB (${r.ratio.toFixed(0)}%)`);
+          const preset = (extra.quality as CompressQuality) || "ebook";
+          addLog(`Compressing PDF (preset: ${preset})...`);
+          const r = await compressPDF(sourceBytes, preset, (pct) => {
+            if (pct % 25 === 0) addLog(`Progress: ${pct}%`);
+          });
+          result = new Uint8Array(r.compressed);
+          fileName = `compressed_${r.savings}pct.pdf`;
+          addLog(`Compressed: ${(r.originalSize / 1024).toFixed(0)}KB → ${(r.compressedSize / 1024).toFixed(0)}KB (${r.savings}% saved, ${r.mode})`);
           break;
         }
         case "split": {
