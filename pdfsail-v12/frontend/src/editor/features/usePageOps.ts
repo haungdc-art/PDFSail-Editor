@@ -38,6 +38,7 @@ export function usePageOps({ pdfLibDocRef, pdfBytesRef }: UsePageOpsParams) {
 
   const handleAddBlankPage = async () => {
     if (!pdfLibDocRef.current) return;
+    if (!window.confirm("Add a blank page after the current page?")) return;
     const current = page - 1;
     const size = pdfLibDocRef.current.getPage(current).getSize();
     pdfLibDocRef.current.insertPage(page, [size.width, size.height]);
@@ -92,6 +93,7 @@ export function usePageOps({ pdfLibDocRef, pdfBytesRef }: UsePageOpsParams) {
 
   const handleDeletePage = async () => {
     if (!pdfLibDocRef.current || totalPages <= 1) return;
+    if (!window.confirm(`Delete page ${page}? This action cannot be undone.`)) return;
     pdfLibDocRef.current.removePage(page - 1);
     setBlocks((prev) => prev.filter((b) => b.page !== page).map((b) => b.page > page ? { ...b, page: b.page - 1 } : b));
     await reloadFromPdfLib();

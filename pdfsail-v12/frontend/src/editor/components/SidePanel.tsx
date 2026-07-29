@@ -75,7 +75,7 @@ export function SidePanel({
         overflowY: "auto",
       }}
     >
-      {/* 页面控制 */}
+      {/* 页面控制 — 增加/减少页面 */}
       <div style={{ marginBottom: 16 }}>
         <div
           style={{
@@ -85,9 +85,15 @@ export function SidePanel({
             fontSize: 11,
             textTransform: "uppercase",
             letterSpacing: 0.5,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
           }}
         >
-          {t("panel.pageControls")}
+          <span>{t("panel.addDeletePages")}</span>
+          <span style={{ fontSize: 10, fontWeight: 400, color: "#94a3b8", textTransform: "none" }}>
+            {t("panel.pageOf")} {page} {t("panel.of")} {totalPages}
+          </span>
         </div>
         <div style={{ display: "flex", gap: 4, alignItems: "center", flexWrap: "wrap" }}>
           <button

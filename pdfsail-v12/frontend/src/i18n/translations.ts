@@ -78,7 +78,7 @@ export const translations = {
     "sig.clear": "Clear",
     "sig.choosePhoto": "Choose Photo",
     // SidePanel
-    "panel.pageControls": "Page Controls",
+    "panel.addDeletePages": "Add / Delete Pages",
     "panel.addBlankPage": "Add blank page",
     "panel.deletePage": "Delete this page",
     "panel.pages": "pages",
@@ -236,7 +236,7 @@ export const translations = {
     "sig.clear": "Limpar",
     "sig.choosePhoto": "Escolher Foto",
     // SidePanel
-    "panel.pageControls": "Controles de Página",
+    "panel.addDeletePages": "Adicionar / Excluir Páginas",
     "panel.addBlankPage": "Adicionar página em branco",
     "panel.deletePage": "Excluir esta página",
     "panel.pages": "páginas",
