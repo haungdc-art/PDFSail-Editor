@@ -10,12 +10,16 @@
 #
 # Render 会自动注入 PORT 环境变量，server.ts 已读取 process.env.PORT
 
-FROM node:18-alpine
+# pdfjs-dist 4.x 要求 node >=20（18 会触发 EBADENGINE，pdf.js 行为未验证）
+FROM node:20-alpine
 
 WORKDIR /app
 
-# 复制依赖声明文件
+# 复制依赖声明文件 + postinstall 所需脚本
+# （package.json 的 postinstall 钩子执行 node scripts/patch-pdfjs-worker.mjs，
+#   必须在 npm install 之前就位，否则构建报 MODULE_NOT_FOUND）
 COPY package*.json ./
+COPY scripts/ ./scripts/
 
 # 安装全部依赖（包括 devDependencies，因为 build 需要 tsc / vite）
 RUN npm install
