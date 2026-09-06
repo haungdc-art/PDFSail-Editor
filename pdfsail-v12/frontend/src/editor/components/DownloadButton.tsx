@@ -4,8 +4,8 @@
  * 页面顶部右上角的 Download 入口：
  *   1. 点击后显示全屏进度条 overlay
  *   2. 调用 handleExport 生成 PDF（不本地下载，拿 blob）
- *   3. 生成 fileKey，上传到 www.pdfsail.com/api/r2-store（Cloudflare R2）
- *   4. 跳转到 https://www.pdfsail.com/[locale]/ready?key=...&tool=editor&...（/ready 页写入 IndexedDB 后跳转 /paywall）
+ *   3. 完成弹框用户点 Download → uploadToR2AndRedirect：明文上传 www.pdfsail.com/api/r2-store（Cloudflare R2）并带 r2 参数
+ *   4. 跳转到 https://www.pdfsail.com/[locale]/ready?key=...&r2=...&tool=editor&...（/ready 页从 R2 取明文 PDF → Download 按钮 → /paywall）
  *   5. 上传失败时 fallback 本地下载
  *
  * 跨域说明：
@@ -214,15 +214,4 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-/**
- * 对 Blob 前 headLen 字节做 XOR 编码（匹配 worker.js paywall 端的 XOR 解码）
- * worker.js L6297: for (let i = 0; i < Math.min(bytes.length, 256); i++) bytes[i] ^= 0x5A;
- */
-async function xorEncodeHead(blob: Blob, headLen: number, xorKey: number): Promise<Blob> {
-  const buf = new Uint8Array(await blob.arrayBuffer());
-  const len = Math.min(buf.length, headLen);
-  for (let i = 0; i < len; i++) buf[i] ^= xorKey;
-  return new Blob([buf], { type: blob.type });
 }

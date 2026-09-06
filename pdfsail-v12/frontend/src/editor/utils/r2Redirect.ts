@@ -2,9 +2,14 @@
  * uploadToR2AndRedirect — 共用 R2 上传 + 跳转 Ready 页
  *
  * 从 DownloadButton.tsx 提取，供 DownloadButton 和 useInlineTools 复用。
- * 流程：生成 token → POST raw body 到 R2 → 跳转 www.pdfsail.com/[locale]/ready（/ready 页写入 IndexedDB 后跳转 /paywall）
+ * 流程：生成 token → POST 明文 PDF 到 R2 → 跳转 www.pdfsail.com/[locale]/ready?r2=token
+ * → /ready 页从 R2 取 PDF（校验 %PDF- 头）→ 生成缩略图 + Download 按钮 → /paywall
  *
- * 上传失败时 fallback 本地下载。
+ * 注意：主站 worker 的 /api/r2-store、/api/r2-file 均不做 XOR 编解码，
+ * /ready 页 R2 路径按明文 %PDF- 头校验，因此必须上传明文（与其他工具 finishToWorkspace 一致）。
+ * IndexedDB 落库时的 XOR 混淆由 /ready 页 saveToHistory 自行完成。
+ *
+ * 上传失败时不允许本地下载（必须走付费流程）。
  */
 
 const R2_STORE_URL = "https://www.pdfsail.com/api/r2-store";
@@ -24,17 +29,6 @@ function getLocale(): string {
     if (stored === "pt") return "pt";
   } catch {}
   return "en";
-}
-
-/**
- * 对 Blob 前 headLen 字节做 XOR 编码（匹配 worker.js paywall 端的 XOR 解码）
- * worker.js L6297: for (let i = 0; i < Math.min(bytes.length, 256); i++) bytes[i] ^= 0x5A;
- */
-async function xorEncodeHead(blob: Blob, headLen: number, xorKey: number): Promise<Blob> {
-  const buf = new Uint8Array(await blob.arrayBuffer());
-  const len = Math.min(buf.length, headLen);
-  for (let i = 0; i < len; i++) buf[i] ^= xorKey;
-  return new Blob([buf], { type: blob.type });
 }
 
 /** 从文件名提取扩展名（不含点号），如 "compressed.pdf" → "pdf" */
@@ -66,17 +60,15 @@ export async function uploadToR2AndRedirect(
     : ext === "zip" ? "application/zip"
     : "application/octet-stream";
 
-  // 上传到 R2
+  // 上传到 R2（明文上传 — 主站 /ready 页 R2 路径按 %PDF- 明文头校验，且 worker 无 XOR 解码）
   let uploaded = false;
   try {
-    // worker.js paywall 端对前 256 字节做 XOR 0x5A 解码，上传前必须编码
-    const uploadBlob = await xorEncodeHead(blob, 256, 0x5a);
     const upResp = await fetch(
       `${R2_STORE_URL}?token=${encodeURIComponent(token)}&tool=editor&ext=${ext}`,
       {
         method: "POST",
         headers: { "Content-Type": contentType },
-        body: uploadBlob,
+        body: blob,
       }
     );
     if (upResp.ok) {
@@ -95,15 +87,16 @@ export async function uploadToR2AndRedirect(
     return false;
   }
 
-  // 跳转到 /ready 页：worker.js 拦截 /ready 路由，从 R2 读取 PDF（XOR 编码）
-  // → 注入 bridge script 写入 IndexedDB（同域 www.pdfsail.com，保持 XOR 编码）
-  // → 主站 /ready 页读取 IndexedDB → xorDecrypt 解码 → 生成缩略图 + 下载按钮
-  // 不传 r2 参数：强制走 IndexedDB 路径（/ready 页 R2 URL 路径的 key 前缀不匹配 editor/）
+  // 跳转到 /ready 页：必须带 r2 参数（token）。
+  // /ready 页用 tool 参数作为 R2 key 前缀，拼出 editor/results/{token}.{ext} 直接从 R2 取明文 PDF，
+  // 校验 %PDF- 头后生成缩略图 + Download 按钮（点击进入 /paywall）。
+  // 不传 r2 会回退 IndexedDB —— 编辑器与主站不同源，IndexedDB 为空，按钮永远不出现。
   // name 带扩展名：让 /ready 页正确判断文件类型
   const locale = getLocale();
 
   const params = new URLSearchParams({
     key: token,
+    r2: token,
     tool: "editor",
     task: toolName,
     name: fileName,
