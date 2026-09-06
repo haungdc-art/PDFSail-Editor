@@ -15,14 +15,17 @@ import { PDFDocument } from "pdf-lib";
 interface UsePageOpsParams {
   pdfLibDocRef: React.MutableRefObject<PDFDocument | null>;
   pdfBytesRef: React.MutableRefObject<ArrayBuffer | null>;
+  /** M7.7-007: 翻页前回调（commit active edit session） */
+  onBeforePageChange?: () => void;
 }
 
-export function usePageOps({ pdfLibDocRef, pdfBytesRef }: UsePageOpsParams) {
+export function usePageOps({ pdfLibDocRef, pdfBytesRef, onBeforePageChange }: UsePageOpsParams) {
   const {
     page, setPage,
     totalPages, setTotalPages,
     pdfDoc, setPdfDoc,
     setBlocks,
+    renderThumbnails,
   } = useEditor();
 
   /** 把 pdfLibDocRef 当前状态序列化回 pdfBytes + pdfDoc（pdfjs） */
@@ -38,19 +41,24 @@ export function usePageOps({ pdfLibDocRef, pdfBytesRef }: UsePageOpsParams) {
 
   const handleAddBlankPage = async () => {
     if (!pdfLibDocRef.current) return;
-    if (!window.confirm("Add a blank page after the current page?")) return;
+    onBeforePageChange?.();
     const current = page - 1;
     const size = pdfLibDocRef.current.getPage(current).getSize();
     pdfLibDocRef.current.insertPage(page, [size.width, size.height]);
     // BUG FIX (Commit 4 +): insertPage(page) 在当前页之后插入新页（新页 = page+1）
     // 仅 page > 当前页 的 blocks 需要后移；当前页 blocks 保持原页
     setBlocks((prev) => prev.map((b) => ({ ...b, page: b.page > page ? b.page + 1 : b.page })));
-    await reloadFromPdfLib();
+    const pdf = await reloadFromPdfLib();
+    // Bug 17 FIX: 重新生成缩略图（包含新增的空白页）
+    if (pdf) {
+      renderThumbnails(pdf);
+    }
     setPage(page + 1);
   };
 
   const handleMovePageUp = async () => {
     if (!pdfLibDocRef.current || page <= 1) return;
+    onBeforePageChange?.();
     const newOrder: number[] = [];
     for (let i = 0; i < totalPages; i++) {
       if (i === page - 2) newOrder.push(page - 1); // current page moved to previous position
@@ -66,12 +74,14 @@ export function usePageOps({ pdfLibDocRef, pdfBytesRef }: UsePageOpsParams) {
       if (b.page === page - 1) return { ...b, page: page };
       return b;
     }));
-    await reloadFromPdfLib();
+    const pdf = await reloadFromPdfLib();
+    if (pdf) renderThumbnails(pdf);
     setPage(page - 1);
   };
 
   const handleMovePageDown = async () => {
     if (!pdfLibDocRef.current || page >= totalPages) return;
+    onBeforePageChange?.();
     const newOrder: number[] = [];
     for (let i = 0; i < totalPages; i++) {
       if (i === page - 1) newOrder.push(page); // current page moved to next position
@@ -87,16 +97,18 @@ export function usePageOps({ pdfLibDocRef, pdfBytesRef }: UsePageOpsParams) {
       if (b.page === page + 1) return { ...b, page: page };
       return b;
     }));
-    await reloadFromPdfLib();
+    const pdf = await reloadFromPdfLib();
+    if (pdf) renderThumbnails(pdf);
     setPage(page + 1);
   };
 
   const handleDeletePage = async () => {
     if (!pdfLibDocRef.current || totalPages <= 1) return;
-    if (!window.confirm(`Delete page ${page}? This action cannot be undone.`)) return;
+    onBeforePageChange?.();
     pdfLibDocRef.current.removePage(page - 1);
     setBlocks((prev) => prev.filter((b) => b.page !== page).map((b) => b.page > page ? { ...b, page: b.page - 1 } : b));
-    await reloadFromPdfLib();
+    const pdf = await reloadFromPdfLib();
+    if (pdf) renderThumbnails(pdf);
     setPage((p) => Math.min(p, totalPages - 1));
   };
 

@@ -56,8 +56,14 @@ export function useInlineTools({ pdfBytesRef, coordRef }: UseInlineToolsParams) 
     addLog(`Loading document bytes...`);
 
     // If there are edits, export first to get final bytes
+    // V12 移植适配（先转换后付费）：PDFEditor 的 processInline 包装器会先走
+    // handleExportWithCommit 导出「含字形级编辑」的最终 PDF，并经 extra.sourceBytes 传入，
+    // 此时跳过本地导出，保证压缩/转换作用在用户看到的那份文档上。
     let sourceBytes: Uint8Array;
-    if (docBlocks.length > 0 && coordRef.current) {
+    if (extra?.sourceBytes) {
+      sourceBytes = extra.sourceBytes as Uint8Array;
+      addLog(`Using pre-exported document bytes (${sourceBytes.length} bytes).`);
+    } else if (docBlocks.length > 0 && coordRef.current) {
       addLog(`Applying ${docBlocks.length} edit(s) to source PDF...`);
       sourceBytes = await exportPDF(docBlocks, coordRef.current, pdfBytesRef.current?.slice(0));
       addLog(`Edits applied successfully.`);

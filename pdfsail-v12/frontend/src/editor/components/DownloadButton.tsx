@@ -70,6 +70,20 @@ export function DownloadButton({ handleExport, disabled }: DownloadButtonProps) 
     setPhase("preparing");
     setProgress(5);
 
+    // ── 开发模式：直接下载，跳过 paywall（Vite 生产构建时该分支被 tree-shake）──
+    if (import.meta.env.DEV) {
+      try {
+        await handleExport(true, true); // download=true 直接触发本地下载
+        setPhase("done");
+        setProgress(100);
+      } catch (e) {
+        console.error("Export failed:", e);
+        setPhase("idle");
+        setProgress(0);
+      }
+      return;
+    }
+
     let result: ExportResult | null;
     try {
       result = await handleExport(true, false);

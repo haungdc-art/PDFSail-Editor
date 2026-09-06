@@ -26,7 +26,7 @@ export function PageThumbnails() {
   return (
     <div
       style={{
-        width: thumbnailCol ? 150 : 28,
+        width: thumbnailCol ? 200 : 28,
         flexShrink: 0,
         background: "#f8fafc",
         borderRight: "1px solid #e2e8f0",

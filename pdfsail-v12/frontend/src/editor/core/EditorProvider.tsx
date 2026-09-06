@@ -13,7 +13,7 @@
  * 通过 useEditor() 拿所需 state + setter。
  */
 
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, type ReactNode, type MutableRefObject } from "react";
 import { useDocument } from "../hooks/useDocument";
 import { useSelection } from "../hooks/useSelection";
 import { useToolState } from "../hooks/useToolState";
@@ -28,8 +28,15 @@ type EditorContextValue = ReturnType<typeof useDocument>
 
 const EditorContext = createContext<EditorContextValue | null>(null);
 
-export function EditorProvider({ children }: { children: ReactNode }) {
-  const documentState = useDocument();
+interface EditorProviderProps {
+  children: ReactNode;
+  /** M7.7-007B: 翻页前回调 ref（commit active edit session）。
+   *  所有通过 useEditor().setPage 的翻页操作都会先执行此回调。 */
+  beforePageChangeRef?: MutableRefObject<(() => void) | null>;
+}
+
+export function EditorProvider({ children, beforePageChangeRef }: EditorProviderProps) {
+  const documentState = useDocument(beforePageChangeRef);
   const selectionState = useSelection();
   const toolState = useToolState();
   const operationState = useOperationState();

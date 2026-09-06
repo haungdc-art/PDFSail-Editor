@@ -21,25 +21,18 @@
  *   - drag/resize mousemove（Canvas 冻结区，Commit 2 才动）
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Block } from "../types";
 import { CommandHistory, PatchBlocksCommand } from "../core/engine";
 import type { Segment } from "../../editor-engine/types";
+import type { EditingBlock } from "../core/editorTypes";
 
 export function useSelection() {
   const [docBlocks, setDocBlocks] = useState<Block[]>([]);
   const [textItems, setTextItems] = useState<any[]>([]);
-  const [showTextLayer, setShowTextLayer] = useState(true);
+  const [showTextLayer, setShowTextLayer] = useState(false);
   const [selectedBlockId, setSelectedBlockId] = useState<string | null>(null);
-  const [editingBlock, setEditingBlock] = useState<{
-    id: string;
-    text: string;
-    x: number;
-    y: number;
-    w: number;
-    h: number;
-    fontSize: number;
-  } | null>(null);
+  const [editingBlock, setEditingBlock] = useState<EditingBlock | null>(null);
   const [ocrSelect, setOcrSelect] = useState<{
     startX: number;
     startY: number;
@@ -51,9 +44,71 @@ export function useSelection() {
   const [segments, setSegments] = useState<Segment[]>([]);
   const [editingSegmentId, setEditingSegmentId] = useState<string | null>(null);
 
+  // ── Document Action Panel: 当前选中的文本（Interaction Layer，不进入编辑核心） ──
+  // Editor 只知道"选中了什么"，剩下的交给 Action Layer。
+  const [selectedText, setSelectedText] = useState<string | null>(null);
+  // 点击文字时解析出的"编辑意图"（等用户点 Update Text 才真正进入编辑）
+  const [pendingEdit, setPendingEdit] = useState<{
+    blockId: string;
+    text: string;
+    bbox: { x: number; y: number; width: number; height: number };
+    fontSize: number;
+    // M5-IMPLEMENT-002C-FIX: 字符级 target（从 onGlyphClick 的 info.glyph.lineId + info.index 忠实传递）
+    lineId?: string;
+    startGlyphIndex?: number;
+    endGlyphIndex?: number;
+  } | null>(null);
+  // Update Text 保存后的反馈状态（B-2：保存后不"什么都不发生"）
+  const [saveStatus, setSaveStatus] = useState<"idle" | "saved">("idle");
+
+  // M7.8-020-PROD：segment 编辑跨页持久化。
+  // PDFEditor 每渲染一页都会 setSegments(该页新 segments) 整份替换，翻页会把上一页的编辑冲掉。
+  // 这里按稳定 key 记录被改过的文本，重建 segments 后回放。
+  const editedSegmentsRef = useRef<Map<string, string>>(new Map());
+
+  // M7.8-041(M7.8-040R-3 导出跨页丢失)：跨页 segment 累积（导出专用）。
+  // 全局 segments state 仍只保留当前页（供逐页 canvas 渲染，避免其它页 segment 串到当前页）。
+  // 但每渲染一页把该页 segments 存入此 Map，导出时展开全部页 → 回写 EditableDocument。
+  const segmentsByPageRef = useRef<Map<number, Segment[]>>(new Map());
+
+  /** 稳定 key：lineId（含 pageIndex）+ 段首坐标 + 原文；重建后仍可匹配同一段 */
+  const segEditKey = (s: Segment) =>
+    `${s.lineId ?? ""}|${(s.pdfX ?? 0).toFixed(1)}|${(s.pdfY ?? 0).toFixed(1)}|${s.originalText ?? ""}`;
+
   /** 修改 segment 文本（编辑框 onBlur 时调用） */
   const handleSegmentChange = useCallback((id: string, newText: string) => {
-    setSegments((prev) => prev.map((s) => (s.id === id ? { ...s, text: newText } : s)));
+    setSegments((prev) =>
+      prev.map((s) => {
+        if (s.id !== id) return s;
+        editedSegmentsRef.current.set(segEditKey(s), newText);
+        return { ...s, text: newText };
+      })
+    );
+  }, []);
+
+  /** 新构建的 segments 回放已保存的编辑（翻页/重渲染后恢复） */
+  const applySegmentEdits = useCallback((segs: Segment[]) => {
+    const store = editedSegmentsRef.current;
+    if (!store.size) return segs;
+    return segs.map((s) => {
+      const edited = store.get(segEditKey(s));
+      return edited !== undefined && edited !== s.text ? { ...s, text: edited } : s;
+    });
+  }, []);
+
+  /** 展开全部已渲染页的 segments（回放跨页编辑），供导出回写 EditableDocument。 */
+  const getAllPageSegments = useCallback((): Segment[] => {
+    const all: Segment[] = [];
+    for (const segs of segmentsByPageRef.current.values()) {
+      all.push(...applySegmentEdits(segs));
+    }
+    return all;
+  }, [applySegmentEdits]);
+
+  /** 清空已保存的 segment 编辑（新文档加载时调用） */
+  const clearSegmentEdits = useCallback(() => {
+    editedSegmentsRef.current.clear();
+    segmentsByPageRef.current.clear();
   }, []);
 
   // ── CommandHistory（替代 UndoRedo） ──
@@ -81,9 +136,12 @@ export function useSelection() {
     (fn: Block[] | ((prev: Block[]) => Block[])) => {
       const holder: { captured: { prev: Block[]; next: Block[] } | null } = { captured: null };
       setDocBlocks((prev) => {
-        const next = typeof fn === "function" ? (fn as (p: Block[]) => Block[])(prev) : fn;
-        holder.captured = { prev, next };
-        return next;
+        // 防御性过滤：移除可能的 null/undefined 条目
+        const safePrev = Array.isArray(prev) ? prev.filter(Boolean) : [];
+        const next = typeof fn === "function" ? (fn as (p: Block[]) => Block[])(safePrev) : fn;
+        const safeNext = Array.isArray(next) ? next.filter(Boolean) : [];
+        holder.captured = { prev: safePrev, next: safeNext };
+        return safeNext;
       });
       if (holder.captured) {
         history.push(new PatchBlocksCommand(holder.captured.prev, holder.captured.next));
@@ -92,11 +150,25 @@ export function useSelection() {
     []
   );
 
+  // M4-IMPL-001 (Gate 6): New Replace 模式下禁用 Undo/Redo，阻止 "docBlocks 回退但 EditableDocument 未回退" 的撕裂。
+  // 原因：New Replace 走 raw setDocBlocks（不进 CommandHistory），EditableDocument 由 New 路径管理，
+  //       此刻 undo 回退 CommandHistory 里的 legacy 命令会制造双态不一致。
+  // 仅读取 window.__replaceMode，不改造 CommandHistory / CommandContext；Legacy 模式行为完全不变。
+  const replaceNewMode = () => typeof window !== "undefined" && (window as any).__replaceMode === "new";
+
   const handleUndo = useCallback(() => {
+    if (replaceNewMode()) {
+      console.warn("[M4] New Replace mode: Undo disabled (EditableDocument history not implemented)");
+      return;
+    }
     history.undo();
   }, []);
 
   const handleRedo = useCallback(() => {
+    if (replaceNewMode()) {
+      console.warn("[M4] New Replace mode: Redo disabled (EditableDocument history not implemented)");
+      return;
+    }
     history.redo();
   }, []);
 
@@ -143,6 +215,19 @@ export function useSelection() {
     setSegments,
     setEditingSegmentId,
     handleSegmentChange,
+    // M7.8-020-PROD: 跨页编辑持久化
+    applySegmentEdits,
+    clearSegmentEdits,
+    // M7.8-041: 跨页 segment 累积（导出专用）
+    segmentsByPageRef,
+    getAllPageSegments,
+    // Document Action Panel
+    selectedText,
+    setSelectedText,
+    pendingEdit,
+    setPendingEdit,
+    saveStatus,
+    setSaveStatus,
     // undo/redo (Commit 4: CommandHistory — instance，不是 ref)
     undoRef,
     history,

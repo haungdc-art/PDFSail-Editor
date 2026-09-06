@@ -1,13 +1,13 @@
 /**
- * PostLoadModal — Commit 4 +
+ * PostLoadModal — V12
  *
  * PDF 加载完成后显示的引导弹框：
- *   - Edit Text → 关闭弹框，激活文本编辑模式（showTextLayer = true）
- *   - Compress PDF → 关闭弹框，打开 Compress 选项弹框
- *   - PDF to Word → 直接调用 processInline("word")
- *   - PDF to JPG → 直接调用 processInline("jpg")
- *
- * 集成 i18n（en + pt-BR）。
+ *   - Edit Text → 激活文本编辑模式
+ *   - PDF to Word → 转换为 Word
+ *   - Compress PDF → 压缩
+ *   - PDF to Excel → 转换为 Excel
+ *   - PDF to JPG → 转换为图片
+ *   - Remove Watermark → 一键去水印（客户端处理）
  */
 
 import { useI18n } from "../../i18n/I18nProvider";
@@ -15,57 +15,76 @@ import { useI18n } from "../../i18n/I18nProvider";
 interface PostLoadModalProps {
   onClose: () => void;
   onEditText: () => void;
-  onCompress: () => void;
   onToWord: () => void;
+  onCompress: () => void;
+  onToExcel: () => void;
   onToJpg: () => void;
+  onRemoveWatermark: () => void;
+  onSplit: () => void;
 }
 
-export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJpg }: PostLoadModalProps) {
+export function PostLoadModal({ onClose, onEditText, onToWord, onCompress, onToExcel, onToJpg, onRemoveWatermark, onSplit }: PostLoadModalProps) {
   const { t } = useI18n();
+
+  const CREDITS_LABEL = "199 Credits ≈ $1.99";
 
   const cards = [
     {
       icon: "✏️",
       title: t("postload.editText"),
       desc: t("postload.editTextDesc"),
+      credits: CREDITS_LABEL,
       color: "#3b82f6",
-      credits: 199,
-      price: "$1.99",
       onClick: onEditText,
-    },
-    {
-      icon: "📦",
-      title: t("postload.compress"),
-      desc: t("postload.compressDesc"),
-      color: "#f59e0b",
-      credits: 199,
-      price: "$1.99",
-      onClick: onCompress,
     },
     {
       icon: "📝",
       title: t("postload.toWord"),
       desc: t("postload.toWordDesc"),
+      credits: CREDITS_LABEL,
       color: "#10b981",
-      credits: 199,
-      price: "$1.99",
       onClick: onToWord,
+    },
+    {
+      icon: "📦",
+      title: t("postload.compress"),
+      desc: t("postload.compressDesc"),
+      credits: CREDITS_LABEL,
+      color: "#f59e0b",
+      onClick: onCompress,
+    },
+    {
+      icon: "🧹",
+      title: t("postload.removeWatermark"),
+      desc: t("postload.removeWatermarkDesc"),
+      credits: CREDITS_LABEL,
+      color: "#ef4444",
+      onClick: onRemoveWatermark,
+    },
+    {
+      icon: "📊",
+      title: t("toolbar.toExcel"),
+      desc: t("postload.toExcelDesc"),
+      credits: CREDITS_LABEL,
+      color: "#8b5cf6",
+      onClick: onToExcel,
     },
     {
       icon: "🖼",
       title: t("postload.toJpg"),
       desc: t("postload.toJpgDesc"),
-      color: "#8b5cf6",
-      credits: 199,
-      price: "$1.99",
+      credits: CREDITS_LABEL,
+      color: "#ec4899",
       onClick: onToJpg,
     },
-  ];
-
-  const perks = [
-    "✓ Preview before payment",
-    "✓ No subscription",
-    "✓ Secure processing",
+    {
+      icon: "✂️",
+      title: t("postload.splitPdf"),
+      desc: t("postload.splitPdfDesc"),
+      credits: CREDITS_LABEL,
+      color: "#06b6d4",
+      onClick: onSplit,
+    },
   ];
 
   return (
@@ -85,8 +104,10 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
           background: "#fff",
           borderRadius: 16,
           padding: "32px 36px",
-          width: 520,
+          width: 560,
           maxWidth: "90vw",
+          maxHeight: "85vh",
+          overflowY: "auto",
           boxShadow: "0 20px 60px rgba(0,0,0,0.25)",
         }}
       >
@@ -101,9 +122,9 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
         </div>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
-          {cards.map((c) => (
+          {cards.map((c, idx) => (
             <button
-              key={c.title}
+              key={idx}
               onClick={c.onClick}
               style={{
                 display: "flex",
@@ -117,6 +138,7 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
                 cursor: "pointer",
                 textAlign: "left",
                 transition: "all 0.15s",
+                gridColumn: idx === 0 ? "1 / -1" : "auto",
               }}
               onMouseEnter={(e) => {
                 e.currentTarget.style.borderColor = c.color;
@@ -130,29 +152,40 @@ export function PostLoadModal({ onClose, onEditText, onCompress, onToWord, onToJ
               <span style={{ fontSize: 24 }}>{c.icon}</span>
               <span style={{ fontSize: 14, fontWeight: 600, color: "#1e293b" }}>{c.title}</span>
               <span style={{ fontSize: 11, color: "#64748b", lineHeight: 1.4 }}>{c.desc}</span>
-              <span style={{ fontSize: 11, fontWeight: 700, color: c.color, marginTop: 2 }}>
-                {c.credits} Credits ≈ {c.price}
+              <span style={{
+                fontSize: 11,
+                fontWeight: 600,
+                color: c.color,
+                marginTop: 2,
+                background: `${c.color}0f`,
+                padding: "2px 8px",
+                borderRadius: 6,
+              }}>
+                {c.credits}
               </span>
             </button>
           ))}
         </div>
 
-        <div
-          style={{
-            marginTop: 16,
-            padding: "12px 16px",
-            background: "#f0fdf4",
-            borderRadius: 8,
-            border: "1px solid #bbf7d0",
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-          }}
-        >
-          {perks.map((p) => (
-            <span key={p} style={{ fontSize: 12, color: "#15803d", fontWeight: 600 }}>
-              {p}
-            </span>
+        <div style={{
+          marginTop: 16,
+          padding: "12px 16px",
+          background: "#f0fdf4",
+          borderRadius: 10,
+          border: "1px solid #bbf7d0",
+          display: "flex",
+          flexDirection: "column",
+          gap: 6,
+        }}>
+          {[
+            "Preview before payment",
+            "No subscription",
+            "Secure processing",
+          ].map((text) => (
+            <div key={text} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#15803d", fontWeight: 500 }}>
+              <span style={{ color: "#22c55e", fontSize: 14 }}>✓</span>
+              <span>{text}</span>
+            </div>
           ))}
         </div>
 

@@ -127,10 +127,11 @@ export class FontAnalyzerImpl implements FontAnalyzer {
     const lineHeight = 1.3;
 
     return {
-      family: isItalic ? `italic ${family}` : family,
+      family,
       rawFontName,
       size: sizePx,
       weight,
+      style: isItalic ? "italic" : "normal",
       color,
       lineHeight,
     };

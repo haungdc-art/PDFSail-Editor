@@ -3,3 +3,12 @@ dist/
 uploads/
 .env
 *.log
+
+# 调试/测试产物（diag/repro 脚本的输出，脚本本身保留）
+backup-pre-v12-editor-20260906/
+scripts/*.pdf
+scripts/*.png
+scripts/*.txt
+frontend/src/**/_*.pdf
+frontend/src/**/_*.txt
+frontend/src/**/_*.log

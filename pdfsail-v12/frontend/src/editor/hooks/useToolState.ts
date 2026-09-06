@@ -34,6 +34,8 @@ export function useToolState() {
   const [showTools, setShowTools] = useState(false);
   const [showSignature, setShowSignature] = useState(false);
   const [addingType, setAddingType] = useState<AddingType>(null);
+  // V12: Find & Replace 面板开关
+  const [showFindReplace, setShowFindReplace] = useState(false);
 
   return {
     textFormat,
@@ -48,6 +50,8 @@ export function useToolState() {
     setShowSignature,
     addingType,
     setAddingType,
+    showFindReplace,
+    setShowFindReplace,
   };
 }
 
