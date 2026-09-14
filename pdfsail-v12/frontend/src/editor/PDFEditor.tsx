@@ -7593,6 +7593,36 @@ function PDFEditorInner({ pageChangeGuardRef }: { pageChangeGuardRef: React.Muta
   // V12: 从 sessionStorage / IndexedDB 读取首页上传的 PDF
   useEffect(() => {
     (async () => {
+      // ── 跨站入口：www.pdfsail.com/edit-pdf 上传后跳转过来 ──
+      // 支持 ?file=<绝对URL>、?r2=<R2 key 或 token>、?fileKey=<token>，可选 ?name=<文件名>
+      try {
+        const ingressFlag = "__pdfsailUrlIngress";
+        const params = new URLSearchParams(window.location.search);
+        const fileParam = params.get("file");
+        const r2Param = params.get("r2") || params.get("fileKey");
+        if ((fileParam || r2Param) && !(window as any)[ingressFlag]) {
+          (window as any)[ingressFlag] = true;
+          const nameParam = params.get("name") || "document.pdf";
+          const srcUrl =
+            fileParam ||
+            `https://www.pdfsail.com/api/r2-file?key=${encodeURIComponent(
+              r2Param!.indexOf("/") >= 0 ? r2Param! : `editor/results/${r2Param}.pdf`
+            )}`;
+          const resp = await fetch(srcUrl, { mode: "cors" });
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const buf = await resp.arrayBuffer();
+          await loadPdfFromArrayBuffer(buf, nameParam);
+          // 加载成功后清掉 URL 参数，避免刷新时重复拉取
+          ["file", "r2", "fileKey", "name"].forEach((k) => params.delete(k));
+          const qs = params.toString();
+          window.history.replaceState(null, "", `${window.location.pathname}${qs ? `?${qs}` : ""}`);
+          return;
+        }
+      } catch (err) {
+        console.error("[ingress] Failed to load PDF from URL:", err);
+        (window as any).__pdfsailUrlIngress = false;
+      }
+
       const SESSION_PDF_KEY = "pdfaide_pending_pdf";
       const raw = sessionStorage.getItem(SESSION_PDF_KEY);
       if (!raw) return;
