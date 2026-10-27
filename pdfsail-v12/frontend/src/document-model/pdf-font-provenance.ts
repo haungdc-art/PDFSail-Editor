@@ -478,8 +478,22 @@ function computeFontResources(
       for (const [k, v] of fod.entries()) {
         const dict = lookup(doc, v);
         if (!isDict(dict)) continue;
+        // M7.9-CID-EMBEDDED-FIX：Type0/CID 复合字体的 /FontDescriptor **不在**字体字典上，
+        // 而在 /DescendantFonts[0]（CIDFont）里（PDF 32000-1 §9.7.2）。旧实现只读直接
+        // /FontDescriptor → 所有嵌入的 Type0 字体（如 SimSun 子集 LNUHNF+SimSun）都被
+        // 误判为 embedded=false（且 fontName 取不到）→ export-renderer 的 native replay
+        // 门禁 `isEmbedded || isType3` 被否决 → 整行回落 Helvetica 逐字重绘，
+        // 字宽与原字体不符 → 字符互相覆盖粘连（用户报告「字距压缩」）。
+        // 与 export-font-assembly.readEmbeddedFontDescriptor 的两态承载处理保持一致。
         const descRef = dict.get(PDFName.of("FontDescriptor"));
-        const desc = lookup(doc, descRef);
+        let desc = lookup(doc, descRef);
+        if (!isDict(desc)) {
+          const dArr = lookup(doc, dict.get(PDFName.of("DescendantFonts")));
+          if (dArr instanceof PDFArray) {
+            const first = lookup(doc, dArr.get(0));
+            if (isDict(first)) desc = lookup(doc, first.get(PDFName.of("FontDescriptor")));
+          }
+        }
         let fontName: string | undefined;
         if (isDict(desc)) {
           const fn = nameOf(desc, "FontName");

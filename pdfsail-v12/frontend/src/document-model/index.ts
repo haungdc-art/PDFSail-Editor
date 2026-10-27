@@ -261,7 +261,7 @@ export {
   type BackgroundRemovalDebug,
 } from "./background-text-remover";
 
-export { GlyphRenderer, type GlyphRendererProps, renderPageGlyphs, type GlyphClickInfo, type GlyphSelectInfo } from "./glyph-renderer";
+export { GlyphRenderer, type GlyphRendererProps, type GlyphClickInfo, type GlyphSelectInfo } from "./glyph-renderer";
 export { BackgroundPatchLayer, type BackgroundPatchLayerProps } from "./background-patch-layer";
 
 // Sprint 6: Glyph Interaction Engine
@@ -316,6 +316,9 @@ export {
   type HistoryEntry,
   type HistorySelection,
   type UndoRedoResult,
+  // F3B-6.4B-6.2a-2：fail-closed inverse contract 的返回/原因类型（纯类型导出）
+  type InverseApplicationResult,
+  type InverseFailureReason,
 } from "./operation-history";
 
 // M7-004A: DerivedSelection → SelectionRange（鼠标拖选，利用 glyphLocalIndex）

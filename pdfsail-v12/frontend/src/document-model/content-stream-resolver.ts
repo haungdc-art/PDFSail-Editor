@@ -229,7 +229,17 @@ export function tokenizeContentStream(text: string): ContentToken[] {
         const numStart = i;
         let numStr = "";
         while (i < n && /[-+0-9.eE]/.test(text[i])) { numStr += text[i]; i++; }
-        inner.push({ kind: "number", value: parseFloat(numStr), start: numStart, end: i });
+        if (i > numStart) {
+          inner.push({ kind: "number", value: parseFloat(numStr), start: numStart, end: i });
+        } else {
+          // B2-FIX（BUG-1）：本分支是 array 元素解析的**最后兜底**。进入此处意味着
+          //   `sc` ∉ { %, \s, /, (, <, ] } 且 ∉ [-+0-9.eE]（如 `>` `)` `=` 字母等）。
+          //   旧实现会 push 一个 `parseFloat("")` 的 number 且 **不推进 i** ⇒ 主/内层
+          //   while 反复处理同一字符 ⇒ zero-progress 死循环（已在真实 Download 中命中）。
+          //   修复：unknown 单字符 → 产出**明确的单字符 op token** 并推进 i，绝不伪造 number。
+          inner.push({ kind: "op", value: text[i], start: i, end: i + 1 });
+          i++;
+        }
       }
       i++; // consume ]
       tokens.push({ kind: "array", value: inner, start, end: i });
@@ -247,6 +257,16 @@ export function tokenizeContentStream(text: string): ContentToken[] {
     const start = i;
     let word = "";
     while (i < n && !/[\s\t\n\r\f()<>/\[\]%]/.test(text[i])) { word += text[i]; i++; }
+    if (i === start) {
+      // B2-FIX（BUG-2）：本分支是主循环的**最后兜底**。走到此处说明 `c` 未被任何前置分支
+      //   消化，却又命中 L249 的排除类 —— 即 `)` / `>` / `]`，以及 `\v`、Unicode 空白
+      //   （L116 的空白集合是显式枚举 `" \t\n\r\f"`，比 L249 的 `\s` 窄，二者不一致）。
+      //   旧实现在这些情况下 `word=""` 且 **不推进 i** ⇒ 主 while 反复处理同一字符 ⇒
+      //   zero-progress 死循环。
+      //   修复：unknown 单字符 → 产出明确的单字符 op token 并推进 i。
+      word = text[i];
+      i++;
+    }
     tokens.push({ kind: "op", value: word, start, end: i });
   }
   return tokens;
@@ -392,17 +412,22 @@ export function parseToUnicodeCMap(
   const text = new TextDecoder("latin1").decode(bytes);
   const map = new Map<number, string>();
 
-  const bfchar = text.match(/beginbfchar[\s\S]*?endbfchar/);
-  if (bfchar) {
+  // 5C-A2-FIX: a single /ToUnicode CMap may be split across MULTIPLE beginbfchar/beginbfrange
+  // blocks (observed: 3 blocks on some CID fonts, 9 on others). The previous non-global regex
+  // matched only the FIRST block, so CIDs declared in later blocks were silently missing → their
+  // operators decoded to no text and lost provenance. Parse ALL blocks (same authoritative source,
+  // strictly additive — no guessing). Per-entry logic below is unchanged.
+  const bfcharBlocks = text.match(/beginbfchar[\s\S]*?endbfchar/g) ?? [];
+  for (const blk of bfcharBlocks) {
     const re = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(bfchar[0]))) map.set(parseInt(m[1], 16), hexToUnicode(m[2]));
+    while ((m = re.exec(blk))) map.set(parseInt(m[1], 16), hexToUnicode(m[2]));
   }
-  const bfrange = text.match(/beginbfrange[\s\S]*?endbfrange/);
-  if (bfrange) {
+  const bfrangeBlocks = text.match(/beginbfrange[\s\S]*?endbfrange/g) ?? [];
+  for (const blk of bfrangeBlocks) {
     const re = /<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(<([0-9A-Fa-f]+)>|\[[\s\S]*?\])/g;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(bfrange[0]))) {
+    while ((m = re.exec(blk))) {
       const lo = parseInt(m[1], 16);
       const hi = parseInt(m[2], 16);
       if (m[3].startsWith("[")) {
@@ -479,13 +504,71 @@ export interface TextShowRecord {
    *  用于与 glyph.char（pdf.js 已解码 unicode）对齐建立 provenance —— operatorText 只是
    *  原始字节的 latin1 解码，对子集字体是无意义乱码，不能作为对齐锚点。无 /ToUnicode 时为 undefined。 */
   unicodeText?: string;
-  /** M7.8-042-FALLBACK-Y · 算子所在文本行矩阵（Tm/Td/TD/T* 累积）的起点，
-   *  原始 PDF 用户空间坐标（未含 cm / Form XObject 变换）。
-   *  供文本兜底剥离做 y 带过滤（仅同 baseline 的算子才参与行匹配，避免跨行误剥离）。
-   *  与 pdf.js glyph 基线（metrics.pdfTransform[5]，视口 y 向下）的关系：
-   *  textY ≈ cropBox.y1 - pdfjsY。无法追踪（畸形流）时为 undefined。 */
-  textX?: number;
-  textY?: number;
+  /** M7.9-BAND-FIX · 该算子绘制时的文本矩阵 Y（PDF Tm/Td 域，与 glyph.metrics.pdfTransform[5]
+   *  同一坐标系）。用于 provenance 匹配的「基线带」约束：跨行/跨带不得互相抢占，
+   *  否则高频重复字符（如表格里的 "3" / "0" / 空格）会被错配到别的行
+   *  → 该行原算子收集不到（残留重影）且别处算子被误剥离（内容丢失）。
+   *  无法追踪到 Tm/Td 时为 undefined（此时退化为纯文本匹配，行为同旧版）。 */
+  tmY?: number;
+}
+
+/** 2D 仿射矩阵 [a b c d e f]（PDF 约定：x' = a·x + c·y + e；y' = b·x + d·y + f） */
+export type Matrix6 = [number, number, number, number, number, number];
+
+/**
+ * m1 × m2 —— PDF `cm` 的**左乘**语义。
+ * 逐位复制自 extractShowTextRecords 内联的 `cm` 分支，保证两条路径合成口径完全一致。
+ */
+function composeCtm(m1: Matrix6, m2: Matrix6): Matrix6 {
+  const [a1, b1, c1, d1, e1, f1] = m1;
+  const [a2, b2, c2, d2, e2, f2] = m2;
+  return [
+    a1 * a2 + b1 * c2,
+    a1 * b2 + b1 * d2,
+    c1 * a2 + d1 * c2,
+    c1 * b2 + d1 * d2,
+    e1 * a2 + f1 * c2 + e2,
+    e1 * b2 + f1 * d2 + f2,
+  ];
+}
+
+/** 流级 CTM 状态机（q/Q 栈 + cm 左乘），供 `Do` 预扫描复用。 */
+function createCtmTracker(initial?: Matrix6) {
+  let ctm: Matrix6 = initial ? ([...initial] as Matrix6) : [1, 0, 0, 1, 0, 0];
+  const stack: Matrix6[] = [];
+  return {
+    get(): Matrix6 {
+      return ctm;
+    },
+    op(name: string, nums: number[]): void {
+      if (name === "cm" && nums.length >= 6) {
+        ctm = composeCtm([nums[0], nums[1], nums[2], nums[3], nums[4], nums[5]], ctm);
+      } else if (name === "q") {
+        stack.push([...ctm] as Matrix6);
+      } else if (name === "Q") {
+        const prev = stack.pop();
+        if (prev) ctm = prev;
+      }
+    },
+  };
+}
+
+/** 读取 Form XObject 的 /Matrix（缺省 = 单位矩阵）。无法解析时返回 undefined（调用方按单位处理）。 */
+function readXObjectMatrix(d: PDFDict | undefined, doc: PDFDocument): Matrix6 | undefined {
+  if (!d) return undefined;
+  const raw = d.get(PDFName.of("Matrix"));
+  if (raw === undefined) return undefined;
+  const arr = raw instanceof PDFRef ? doc.context.lookup(raw) : raw;
+  const asArray = (arr as { asArray?: () => unknown[] } | undefined)?.asArray?.();
+  if (!asArray || asArray.length < 6) return undefined;
+  const nums: number[] = [];
+  for (let i = 0; i < 6; i++) {
+    const n = asArray[i] as { asNumber?: () => number } | undefined;
+    const v = n?.asNumber?.();
+    if (typeof v !== "number" || !Number.isFinite(v)) return undefined;
+    nums.push(v);
+  }
+  return nums as Matrix6;
 }
 
 /** M7.7-004A：extractShowTextRecords 选项（ToUnicode 感知的 CID hex 解码） */
@@ -499,6 +582,34 @@ export interface ShowTextExtractOptions {
   /** M7.8-036-FIX-001：PDFDocument 实例，decodeCharCodes 解析 Type0 /Encoding 的
    *  CMap 引用时需要。缺省时 Type0 非 Name 型 /Encoding 判为 unknown。 */
   doc?: PDFDocument;
+  /**
+   * F3B-6.17-5C-A1 · 该流的**初始 CTM**（页面空间）。
+   *
+   * 用于 Form XObject：XObject 内容被 `/Matrix` + `Do` 处的页面 CTM 放置，
+   * 其内部 Tm 处于**局部坐标**。若不把它合成进来，`finalTmY()` 返回局部 Y，
+   * 与页面空间的 glyph 基线带（`glyph.metrics.pdfTransform[5]`）差一个放置偏移
+   * ⇒ provenance 的基线带约束把绝大多数算子判为跨行而拒绝
+   * ⇒ coverage 崩塌 → fail-closed 整页放弃 → 导出无法剥离原文（残留）。
+   *
+   * 缺省 = 单位矩阵（页面内容流的历史行为，逐字节不变）。
+   */
+  initialCtm?: Matrix6;
+  /**
+   * 5C-A2②：page /Contents 为**数组**时，PDF 32000-1 §7.8.2 规定各流「按单流拼接处理」，
+   * **文本状态（含当前字体，由 Tf 设置）跨流延续**（BT 只重置文本矩阵/行矩阵，不重置字体）。
+   * 逐流重置 `curFont` 会让数组里第 2..N 流中「本流未设字体、沿用前流」的 showText 算子
+   * 拿不到字体 → decodeCharCodes 返回 null → 无 charCodes → 丢 operator provenance。
+   * 实测某 CJK 简历 8 个算子因此丢失（4 个位于所在流 byte 0）。
+   *
+   * 缺省 = null（单流 / 无跨流需求的既有行为不变）。
+   */
+  initialFont?: string | null;
+  /**
+   * 5C-A2②：跨流共享的可变载体。extractShowTextRecords 入口读取 `curFont` 作为初值，
+   * 出口写回该流结束时的当前字体，供调用方串起 /Contents 数组的下一流。
+   * 仅 page 内容流之间传递；Form XObject 不参与（各自独立放置）。
+   */
+  fontCarryState?: { curFont?: string | null };
 }
 
 /** 解析单个 content stream 文本为 showText 记录列表（含字体状态跟踪） */
@@ -510,47 +621,68 @@ export function extractShowTextRecords(
 ): TextShowRecord[] {
   const tokens = tokenizeContentStream(contentText);
   const records: TextShowRecord[] = [];
-  let curFont: string | null = null;
+  // 5C-A2②：入口接受「前一流延续下来的当前字体」（/Contents 数组按单流拼接，文本状态跨流延续）。
+  let curFont: string | null = opts?.initialFont ?? opts?.fontCarryState?.curFont ?? null;
   let seq = 0;
-  // M7.8-042-FALLBACK-Y：文本行矩阵追踪（Tm/Td/TD/TL/T*/'/"），供算子记录携带 baseline。
-  let lineMatrix: [number, number, number, number, number, number] = [1, 0, 0, 1, 0, 0];
-  let leading = 0;
-  const prevNums = (idx: number, max: number): number[] => {
-    const out: number[] = [];
-    let k = idx - 1;
-    while (k >= 0 && tokens[k].kind === "number" && out.length < max) {
-      out.unshift((tokens[k] as { value: number }).value);
-      k--;
-    }
-    return out;
+  // M7.9-BAND-FIX：追踪文本矩阵 Y（Tm 绝对定位 / Td·TD 相对位移）。
+  // 坐标系与 glyph.metrics.pdfTransform[5] 一致（均为「流内 Tm 域」，未叠加外层 cm），
+  // 供 assignOperatorProvenance 做基线带约束。
+  // 当前文本原点（Tm 的 e/f，经 Td 累加），及当前 CTM（含 q/Q 栈）。
+  // glyph.metrics.pdfTransform[5] 是**最终 PDF 坐标**（已叠加外层 cm），
+  // 故算子侧必须同样合成 cm 才能比对 —— 只取流内 Tm 的 f 会差一个 cm 平移（实测 374.85pt）。
+  let curTmE: number | undefined = undefined;
+  let curTmF: number | undefined = undefined;
+  // F3B-6.17-5C-A1：Form XObject 由 initialCtm 带入其放置变换（页面 CTM × /Matrix）。
+  // 页面内容流不传 ⇒ 单位矩阵，历史行为逐字节不变。
+  let ctm: [number, number, number, number, number, number] = opts?.initialCtm
+    ? ([...opts.initialCtm] as [number, number, number, number, number, number])
+    : [1, 0, 0, 1, 0, 0];
+  const ctmStack: [number, number, number, number, number, number][] = [];
+  const pendingNums: number[] = [];
+  /** 文本原点经 CTM 后的最终 PDF y */
+  const finalTmY = (): number | undefined => {
+    if (curTmE === undefined || curTmF === undefined) return undefined;
+    return ctm[1] * curTmE + ctm[3] * curTmF + ctm[5];
   };
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i];
-    // 文本状态算子：维护行矩阵（textY = 行矩阵 f 分量 = baseline 的原始用户空间 y）
+    if (tok.kind === "number") {
+      pendingNums.push(Number(tok.value));
+      if (pendingNums.length > 6) pendingNums.shift();
+      continue;
+    }
     if (tok.kind === "op") {
-      const v = tok.value;
-      if (v === "BT") {
-        lineMatrix = [1, 0, 0, 1, 0, 0];
-      } else if (v === "Tm") {
-        const n = prevNums(i, 6);
-        if (n.length === 6) lineMatrix = [n[0], n[1], n[2], n[3], n[4], n[5]];
-      } else if (v === "Td" || v === "TD") {
-        const n = prevNums(i, 2);
-        if (n.length === 2) {
-          const [tx, ty] = n;
-          lineMatrix = [
-            lineMatrix[0], lineMatrix[1], lineMatrix[2], lineMatrix[3],
-            lineMatrix[4] + tx * lineMatrix[0] + ty * lineMatrix[2],
-            lineMatrix[5] + tx * lineMatrix[1] + ty * lineMatrix[3],
-          ];
-          if (v === "TD") leading = -ty;
-        }
-      } else if (v === "TL") {
-        const n = prevNums(i, 1);
-        if (n.length === 1) leading = n[0];
-      } else if (v === "T*" || v === "'" || v === '"') {
-        lineMatrix = [lineMatrix[0], lineMatrix[1], lineMatrix[2], lineMatrix[3], lineMatrix[4], lineMatrix[5] - leading];
+      if (tok.value === "Tm" && pendingNums.length >= 6) {
+        curTmE = pendingNums[4];
+        curTmF = pendingNums[5];
+      } else if (
+        (tok.value === "Td" || tok.value === "TD") &&
+        pendingNums.length >= 2 &&
+        curTmE !== undefined &&
+        curTmF !== undefined
+      ) {
+        curTmE += pendingNums[0];
+        curTmF += pendingNums[1];
+      } else if (tok.value === "cm" && pendingNums.length >= 6) {
+        // CTM ← cm × CTM（PDF 中 cm 为左乘）
+        const [a1, b1, c1, d1, e1, f1] = pendingNums;
+        const [a2, b2, c2, d2, e2, f2] = ctm;
+        ctm = [
+          a1 * a2 + b1 * c2,
+          a1 * b2 + b1 * d2,
+          c1 * a2 + d1 * c2,
+          c1 * b2 + d1 * d2,
+          e1 * a2 + f1 * c2 + e2,
+          e1 * b2 + f1 * d2 + f2,
+        ];
+      } else if (tok.value === "q") {
+        ctmStack.push([...ctm] as [number, number, number, number, number, number]);
+      } else if (tok.value === "Q") {
+        const prev = ctmStack.pop();
+        if (prev) ctm = prev;
       }
+      pendingNums.length = 0;
+      continue;
     }
     // /Fnn <size> Tf → 字体资源（Tf 带字号操作数）
     if (
@@ -591,8 +723,7 @@ export function extractShowTextRecords(
         charCodes: decoded.codes,
         charCodeBasis: decoded.basis,
         unicodeText,
-        textX: lineMatrix[4],
-        textY: lineMatrix[5],
+        tmY: finalTmY(),
       });
       seq++;
       i++; // skip Tj
@@ -626,14 +757,15 @@ export function extractShowTextRecords(
         charCodes: tjDecoded.codes,
         charCodeBasis: tjDecoded.basis,
         unicodeText,
-        textX: lineMatrix[4],
-        textY: lineMatrix[5],
+        tmY: finalTmY(),
       });
       seq++;
       i++; // skip TJ
       continue;
     }
   }
+  // 5C-A2②：把该流结束时的当前字体写回载体，供 /Contents 数组的下一流继承。
+  if (opts?.fontCarryState) opts.fontCarryState.curFont = curFont;
   return records;
 }
 
@@ -730,14 +862,34 @@ export function resolvePageShowTextWithXObjects(
   const page = doc.getPage(pageIndex) as any;
   const pageRes = (page.node.Resources?.() as PDFDict) ?? undefined;
   const seen = new Set<string>();
-  const result: Array<{ ref: string; text: string; resDict: PDFDict | undefined; streamIndex: number }> = [];
-  const queue: Array<{ ref: string; text: string; resDict: PDFDict | undefined; streamIndex: number }> = [];
+  // F3B-6.17-5C-A1：图形状态必须沿内容流树**连续携带**。
+  //   ① page /Contents 是**数组**时，PDF 32000-1 §7.8.2 规定各流「按单流拼接处理」，
+  //      图形状态（CTM 等）跨流延续；逐流重置会让数组里第 2..N 流的算子落在错误坐标系。
+  //   ② Form XObject 的入口 CTM = Do 处 CTM × 该 XObject 的 /Matrix。
+  type StreamItem = {
+    ref: string;
+    text: string;
+    resDict: PDFDict | undefined;
+    streamIndex: number;
+    ctm?: Matrix6;
+    /** 是否为 page /Contents 数组中的流（需跨流继承图形状态） */
+    isPageStream?: boolean;
+  };
+  const result: StreamItem[] = [];
+  const queue: StreamItem[] = [];
   let xobjIdx = 1_000_000; // 给 XObject 流不与 page 内容流冲突的序号（strip 不再依赖它）
 
-  const enqueue = (ref: string, text: string, resDict: PDFDict | undefined, streamIndex: number) => {
+  const enqueue = (
+    ref: string,
+    text: string,
+    resDict: PDFDict | undefined,
+    streamIndex: number,
+    ctm?: Matrix6,
+    isPageStream?: boolean,
+  ) => {
     if (seen.has(ref)) return;
     seen.add(ref);
-    const item = { ref, text, resDict, streamIndex };
+    const item: StreamItem = { ref, text, resDict, streamIndex, ctm, isPageStream };
     result.push(item);
     queue.push(item);
   };
@@ -746,15 +898,47 @@ export function resolvePageShowTextWithXObjects(
   for (const s of pageStreams) {
     const bytes = streamToBytes(s.obj);
     if (!bytes) continue;
-    enqueue(s.ref, new TextDecoder("latin1").decode(bytes), pageRes, s.streamIndex);
+    enqueue(s.ref, new TextDecoder("latin1").decode(bytes), pageRes, s.streamIndex, undefined, true);
   }
 
+  // [RESOLVE-B2] 临时诊断计数器（可移除；仅观察，不改变逻辑）
+  let resolveIteration = 0;
+  // ★ 5C-A1①：跨 /Contents 数组各流携带的 CTM（PDF 7.8.2：数组按单流拼接处理）
+  let carriedPageCtm: Matrix6 | undefined = undefined;
   while (queue.length) {
     const cur = queue.shift()!;
+    resolveIteration++;
+    console.log("[RESOLVE-B2] iter", {
+      i: resolveIteration,
+      queueLen: queue.length,
+      ref: cur.ref,
+      textLen: cur.text.length,
+    });
+    console.log(`[RESOLVE-B2] before-tokenize i=${resolveIteration}`);
     const tokens = tokenizeContentStream(cur.text);
+    console.log(`[RESOLVE-B2] after-tokenize i=${resolveIteration} tokens=${tokens.length}`);
+    console.log(`[RESOLVE-B2] before-token-processing i=${resolveIteration}`);
+    // F3B-6.17-5C-A1：追踪 Do 处的 CTM（q/Q/cm），用于跨流继承与 XObject 放置合成。
+    //   page /Contents 数组的后续流从**上一流结束时的 CTM** 起（PDF 7.8.2）；
+    //   XObject 流从「父流 Do 处 CTM × 自身 /Matrix」起。
+    const startCtm = cur.ctm ?? (cur.isPageStream ? carriedPageCtm : undefined);
+    cur.ctm = startCtm; // 固化入口 CTM，供下方 extraction 循环使用
+    const tracker = createCtmTracker(startCtm);
+    const pendingNums: number[] = [];
     for (let i = 0; i + 1 < tokens.length; i++) {
+      if (tokens[i].kind === "number") {
+        pendingNums.push(Number(tokens[i].value));
+        if (pendingNums.length > 6) pendingNums.shift();
+        continue;
+      }
+      if (tokens[i].kind === "op") {
+        tracker.op(tokens[i].value, pendingNums);
+        pendingNums.length = 0;
+        continue;
+      }
       // name Do → 该 XObject 由当前 resources /XObject 解析
       if (tokens[i].kind === "name" && tokens[i + 1].kind === "op" && tokens[i + 1].value === "Do") {
+        console.log(`[RESOLVE-B2] do-found i=${resolveIteration} tok=${i} name=${tokens[i].value}`);
         const name = tokens[i].value;
         const resDict = cur.resDict ?? pageRes;
         if (!resDict) continue;
@@ -774,14 +958,25 @@ export function resolvePageShowTextWithXObjects(
         const xrefStr = xref instanceof PDFRef ? `${xref.objectNumber} ${xref.generationNumber} R` : undefined;
         if (xrefStr) {
           const xres = d instanceof PDFDict ? (d.get(PDFName.of("Resources")) as PDFDict | undefined) : undefined;
-          enqueue(xrefStr, new TextDecoder("latin1").decode(xbytes), xres, xobjIdx++);
+          // ★ 5C-A1：XObject 放置变换 = Do 处 CTM × /Matrix（缺省 /Matrix ⇒ 单位阵）
+          const xm = readXObjectMatrix(d instanceof PDFDict ? d : undefined, doc);
+          const childCtm = xm ? composeCtm(tracker.get(), xm) : tracker.get();
+          enqueue(xrefStr, new TextDecoder("latin1").decode(xbytes), xres, xobjIdx++, childCtm);
         }
       }
     }
+    // ★ 5C-A1①：把本页内容流结束时的 CTM 交给数组中的下一条流
+    if (cur.isPageStream) carriedPageCtm = tracker.get();
+    console.log(`[RESOLVE-B2] after-token-processing i=${resolveIteration}`);
   }
 
+  // [RESOLVE-B2] 临时诊断 marker（可移除；仅观察，不改变返回值）
+  console.log("[RESOLVE-B2] done", { iterations: resolveIteration, remainingQueue: queue.length });
   const fontOf = resolvePageFontResource(doc, pageIndex);
   const out: Array<TextShowRecord & { fontResource: FontResourceBinding[] }> = [];
+  // 5C-A2②：page /Contents 数组各流按「单流拼接」处理 ⇒ 文本状态（当前字体）跨流延续。
+  // 用一个共享载体把前一流末尾的 curFont 传给下一流；Form XObject 不参与（各自独立放置）。
+  const pageFontCarry: { curFont?: string | null } = {};
   for (const s of result) {
     // M7.8-036-FIX-001：每个流用自己的资源字典 —— 页面流用 page /Resources，
     // Form XObject 流用该 XObject 自己的 /Resources（字体常只挂在 Form 下）。
@@ -790,6 +985,10 @@ export function resolvePageShowTextWithXObjects(
       ...(opts ?? {}),
       resolveFontDict,
       doc,
+      // F3B-6.17-5C-A1：把该流的放置 CTM 带入，使 tmY 落在页面空间。
+      initialCtm: (opts ?? {}).initialCtm ?? s.ctm,
+      // 5C-A2②：仅 page 内容流共享字体载体（XObject 之间不传递）。
+      ...(s.isPageStream ? { fontCarryState: pageFontCarry } : {}),
     });
     for (const r of records) out.push({ ...r, fontResource: fontOf(r.fontResourceKey) });
   }

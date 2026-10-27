@@ -180,14 +180,13 @@ export function mutateLineText(
         // （第一个 glyph 的 styleRef），仅当 replacement 比原选区长时使用。
         const fallbackStyleRef = line.glyphs[0]?.styleRef ?? 0;
         const style = line.style || doc.styles[fallbackStyleRef] || {};
-        const mapResult = mapNewTextToOriginalGlyphs(
+        const { newGlyphs, droppedOperatorIds } = mapNewTextToOriginalGlyphs(
           line.glyphs,
           newText,
           style,
           fallbackStyleRef,
           range
         );
-        const { newGlyphs } = mapResult;
 
         // M7.7-010.7: 带 baseline 数据的 glyph 几何审计
         const origFirst = line.glyphs[0];
@@ -269,18 +268,21 @@ export function mutateLineText(
         const editedOriginalBounds: BBox[] | undefined =
           newEditedRect ? [...(line.editedOriginalBounds ?? []), newEditedRect] : line.editedOriginalBounds;
 
-        // M7.8-042-ORPHAN：新文本比原选区短时，mapNewTextToOriginalGlyphs 会丢弃尾部原 glyph，
-        // 其 operatorId 随 glyph 消失 → 导出 strip 按 glyph.operatorId 收集不到 → 原算子残留成重影
-        // （实测 "100%"→"99%" 导出残留孤立 "%"）。此处把孤儿算子累加合并到行上，供导出剥离。
-        const { droppedOperatorIds } = mapResult;
-        const mergedDropped =
-          droppedOperatorIds && droppedOperatorIds.length > 0
-            ? [...(line.droppedOperatorIds ?? []), ...droppedOperatorIds].filter(
-                (id, i, arr) => arr.indexOf(id) === i,
-              )
-            : line.droppedOperatorIds;
+        // M7.9-ORPHAN-FIX：累加「被丢弃原 glyph」的算子 id。
+        // 表格多列会按 segment 多次调用本函数，每次只覆盖本段；若用单值会被后段覆盖，
+        // 导致前段孤儿算子丢失 → 旧文字残留。故按数组合并去重。
+        const prevDropped = line.droppedOperatorIds ?? [];
+        const mergedDropped: string[] = [...prevDropped];
+        for (const id of droppedOperatorIds ?? []) {
+          if (!mergedDropped.includes(id)) mergedDropped.push(id);
+        }
 
-        return { ...line, glyphs: newGlyphs, editedOriginalBounds, droppedOperatorIds: mergedDropped };
+        return {
+          ...line,
+          glyphs: newGlyphs,
+          editedOriginalBounds,
+          droppedOperatorIds: mergedDropped.length > 0 ? mergedDropped : undefined,
+        };
       });
 
       return { ...block, lines };

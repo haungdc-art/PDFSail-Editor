@@ -7,8 +7,12 @@
  */
 import type { DocumentSelection } from "./document-selection";
 
-/** 能力名称（Intent 层使用；Registry 把 name → Command） */
-export type CapabilityName = "replace" | "delete" | "rewrite" | "fixOcr";
+/**
+ * 能力名称（Intent 层使用；Registry 把 name → Command）。
+ * F3B-6.25：`translate` 自 E4 起由 `CapabilityReplaceCommand` 正式注册
+ *（PDFEditor 组合根），类型层与之对齐（此前 3C-8 记录的 mismatch 已收口）。
+ */
+export type CapabilityName = "replace" | "delete" | "rewrite" | "fixOcr" | "translate";
 
 /** 能力 Command（自包含执行器，不感知自身能力名） */
 export interface CapabilityCommand {

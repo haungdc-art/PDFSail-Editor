@@ -257,7 +257,15 @@ export function renderToBlocks(doc: EditableDocument): Block[] {
   try {
     const objects = renderDocument(doc);
     // RenderableTextObject 的字段是 TextBlock 的超集，安全转换
-    return objects as unknown as Block[];
+    // B2-B：renderToBlocks 是 Core 文本投影的唯一生产者，统一标记为 projection，
+    // 以便 mergeDocBlocksProjection 只替换/清理这些投影，绝不触碰 authored blocks。
+    return objects.map(
+      (o) =>
+        ({
+          ...(o as unknown as Record<string, unknown>),
+          __coreProjection: true,
+        } as unknown as Block),
+    );
   } catch (e) {
     console.warn("[DocumentRenderer] renderToBlocks failed, returning empty:", e);
     return [];

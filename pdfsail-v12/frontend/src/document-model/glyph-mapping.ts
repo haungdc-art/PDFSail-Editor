@@ -167,11 +167,24 @@ export interface GlyphMappingResult {
   /** 新 glyph 数量 */
   newCount: number;
   /**
-   * M7.8-042-ORPHAN：本次映射中被丢弃的原 glyph 的 operatorId（去重、剔除 undefined）。
-   * 新文本比原文本短（删除字符）时产生 —— 这些原算子仍留在 PDF content stream 里，
-   * 必须在导出时剥离，否则原字符残留成重影（实测 "100%"→"99%" 残留孤立 "%"）。
+   * M7.9-ORPHAN-FIX：被丢弃原 glyph 的 operatorId（去重）。
+   *
+   * 缩短编辑（新文本短于原选区）时，原选区尾部未被映射的原 glyph 不进入 newGlyphs，
+   * 其 operatorId 若无人接管，导出便无法定位并剥离对应原算子 → 旧文字残留重影
+   * （实测 "100%"→"99%" 后残留一个 "%"）。调用方需把它累加到 `EditableLine.droppedOperatorIds`。
    */
   droppedOperatorIds?: string[];
+}
+
+/**
+ * M7.9-ORPHAN-FIX：收集一组被丢弃原 glyph 的 operatorId（去重、保持顺序）。
+ */
+function collectDroppedOperatorIds(glyphs: EditableGlyph[]): string[] {
+  const out: string[] = [];
+  for (const g of glyphs) {
+    if (g.operatorId && !out.includes(g.operatorId)) out.push(g.operatorId);
+  }
+  return out;
 }
 
 /**
@@ -190,6 +203,35 @@ export interface GlyphMappingResult {
  *   4. 新文本更短 → 剩余原位置留空
  *   5. 新文本更长 → 超出部分在行尾追加（不换行）
  */
+/**
+ * F3B-6.5-C — glyph 区间 → UTF-16 code-unit 区间 的纯函数适配器。
+ *
+ * 契约：把一行 glyph 的 **inclusive** glyph 区间 [startGlyphIndex, endGlyphIndex]
+ * 转换为该行文本（= `glyphs.map(g => g.char).join("")`）内的 **UTF-16 code-unit** 区间 [start, end)。
+ *
+ * 关键：累加 `glyph.char.length`（UTF-16 单元数），**绝不**把 glyph index 当字符 / UTF-16 offset。
+ * 与 Core `editor/core/position/types.ts` 的 `Position.offset`（UTF-16 code-unit）对齐。
+ *
+ * 用途：Segment 坐标（glyph index）是 Legacy 真相坐标；Core / 字符串切片使用 UTF-16 offset。
+ * 本函数是把 Legacy glyph 坐标安全翻译成 Core UTF-16 坐标的唯一处，避免重新制造第二套坐标 Truth。
+ *
+ * 纯函数，无状态，不依赖任何 document / Segment / Ledger。
+ */
+export function glyphRangeToUtf16Range(
+  glyphs: readonly EditableGlyph[],
+  startGlyphIndex: number,
+  endGlyphIndex: number,
+): { start: number; end: number } {
+  const n = glyphs.length;
+  const start = Math.max(0, Math.min(startGlyphIndex, Math.max(0, n - 1)));
+  const end = Math.max(start, Math.min(endGlyphIndex, Math.max(0, n - 1)));
+  let utf16Start = 0;
+  for (let i = 0; i < start; i++) utf16Start += glyphs[i]?.char.length ?? 0;
+  let utf16End = utf16Start;
+  for (let i = start; i <= end; i++) utf16End += glyphs[i]?.char.length ?? 0;
+  return { start: utf16Start, end: utf16End };
+}
+
 export function mapNewTextToOriginalGlyphs(
   originalGlyphs: EditableGlyph[],
   newText: string,
@@ -233,9 +275,15 @@ export function mapNewTextToOriginalGlyphs(
     // 修复：取 newText 尾部与原 suffix 的**最长公共后缀 L**（比较时忽略行尾空白），
     //   replacement = newText[start, newText.length - L]。
     //   suffixGlyphs 仍是原对象（原空格/分隔符几何完整保留）→ 原生 Tj/TJ 重建可恢复 TJ spacing。
+    // F3B-6.5-C: glyph index → UTF-16 code-unit 偏移。累加 glyph.char.length，
+    // 绝不把 glyph index 当字符 / UTF-16 offset（surrogate pair / 多字符 glyph 下两者不等）。
+    // 仅用于从 newText（整行）按 UTF-16 边界切出 replacement；originalGlyphs 仍按 glyph index 索引。
+    let utf16Start = 0;
+    for (let i = 0; i < start; i++) utf16Start += originalGlyphs[i]?.char.length ?? 0;
+
     const suffixText = suffixGlyphs.map((g) => g.char).join("");
     const stripTrailingWs = (s: string) => s.replace(/\s+$/, "");
-    const newTail = stripTrailingWs(newText.slice(start));
+    const newTail = stripTrailingWs(newText.slice(utf16Start));
     const suffixTrimmed = stripTrailingWs(suffixText);
     let commonSuffixLen = 0;
     const maxCommon = Math.min(newTail.length, suffixTrimmed.length);
@@ -246,7 +294,16 @@ export function mapNewTextToOriginalGlyphs(
     ) {
       commonSuffixLen++;
     }
-    const replacementText = newText.slice(start, newText.length - commonSuffixLen);
+    const replacementText = newText.slice(utf16Start, newText.length - commonSuffixLen);
+
+    // M7.9-ORPHAN-FIX：收集「缩短编辑」中被丢弃的原 glyph 算子。
+    // 原选区 [start, end] 内、下标 ≥ start + replacement 长度的那些原 glyph 不会被任何
+    // 新 glyph 继承（replacement 循环只覆盖 replacementText 长度的区间），若不在此登记，
+    // 它们的 operatorId 将随新 glyph 数组一起消失 → 导出收集不到 → 原算子残留成重影。
+    const replacementLen = Array.from(replacementText).length;
+    const droppedOperatorIds = collectDroppedOperatorIds(
+      originalGlyphs.slice(start + replacementLen, end + 1),
+    );
 
     const prefixGlyphs = originalGlyphs.slice(0, start);
 
@@ -488,19 +545,6 @@ export function mapNewTextToOriginalGlyphs(
       prevRight = left + w; // 用原始右边界推进（列间隙存在于原始坐标）
     }
 
-    // M7.8-042-ORPHAN：replacement 比原选区 [start..end] 短时，尾部原 glyph
-    // （如 "100%"→"99%" 的原 "%"）被丢弃，其 operatorId 不再出现在新 glyph 数组里。
-    // 这些「孤儿算子」仍留在 content stream → 必须收集并交导出剥离，否则原字符残留成重影。
-    const consumedCount = replacementGlyphs.length;
-    const droppedOperatorIds =
-      start + consumedCount <= end
-        ? originalGlyphs
-            .slice(start + consumedCount, end + 1)
-            .map((g) => g.operatorId)
-            .filter((id): id is string => typeof id === "string" && id.length > 0)
-            .filter((id, i, arr) => arr.indexOf(id) === i)
-        : [];
-
     return {
       // M7.8-035R: 前缀 glyph 保持原位（编辑前内容不动）。
       //   后缀 glyph（含上一轮已提交的编辑）重置 modified=false 并按 shift 位移
@@ -600,23 +644,16 @@ export function mapNewTextToOriginalGlyphs(
     }
   });
 
-  // M7.8-042-ORPHAN：整行重写比原文短时（如 "abcdef"→"abc"），尾部原 glyph 被丢弃，
-  // 其 operatorId 同样成为孤儿 → 收集交导出剥离，防止原字符残留成重影。
-  const wholeLineDropped =
-    newChars.length < originalGlyphs.length
-      ? originalGlyphs
-          .slice(newChars.length)
-          .map((g) => g.operatorId)
-          .filter((id): id is string => typeof id === "string" && id.length > 0)
-          .filter((id, i, arr) => arr.indexOf(id) === i)
-      : [];
+  // M7.9-ORPHAN-FIX：整行重写路径中，新文本比原行短时尾部原 glyph 同样被丢弃，
+  // 其 operatorId 必须登记，否则导出残留原算子（与 range 路径同一根因）。
+  const droppedOperatorIds = collectDroppedOperatorIds(originalGlyphs.slice(newChars.length));
 
   return {
     newGlyphs,
     modifiedIndices,
     originalCount: originalGlyphs.length,
     newCount: newGlyphs.length,
-    droppedOperatorIds: wholeLineDropped,
+    droppedOperatorIds,
   };
 }
 
@@ -691,26 +728,27 @@ export function replaceLineText(
   const style = line.style || (styles ? styles[line.glyphs[0]?.styleRef ?? 0] : {}) || {};
   const styleRef = line.glyphs[0]?.styleRef ?? 0;
 
-  const mapResult = mapNewTextToOriginalGlyphs(
+  const { newGlyphs, droppedOperatorIds } = mapNewTextToOriginalGlyphs(
     line.glyphs,
     newText,
     style,
     styleRef,
     range
   );
-  const { newGlyphs, droppedOperatorIds } = mapResult;
 
   const newLines = [...block.lines];
   newLines[lineIndex] = {
     ...line,
     glyphs: newGlyphs,
-    // M7.8-042-ORPHAN：变短编辑丢弃的原 glyph 算子累加到行，供导出剥离（防重影）。
-    droppedOperatorIds:
-      droppedOperatorIds && droppedOperatorIds.length > 0
-        ? [...(line.droppedOperatorIds ?? []), ...droppedOperatorIds].filter(
-            (id, i, arr) => arr.indexOf(id) === i,
-          )
-        : line.droppedOperatorIds,
+    // M7.9-ORPHAN-FIX：与 mutateLineText 同口径累加被丢弃原 glyph 的算子，
+    // 确保本路径编辑的缩短行也能在导出时剥离孤儿算子、不残留旧文字。
+    droppedOperatorIds: (() => {
+      const merged = [...(line.droppedOperatorIds ?? [])];
+      for (const id of droppedOperatorIds ?? []) {
+        if (!merged.includes(id)) merged.push(id);
+      }
+      return merged.length > 0 ? merged : undefined;
+    })(),
     // 保持行 bbox 不变（位置不变，不影响下一行）
   };
 

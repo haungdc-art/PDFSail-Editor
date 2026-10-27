@@ -10,11 +10,10 @@
 
 import * as pdfjsLib from "pdfjs-dist";
 import { PDFDocument, degrees, rgb } from "pdf-lib";
+import { PDFJS_WORKER_SRC } from "../pdfjs-worker-src";
+import { decideStage2Outcome, toPdfBytes, type CompressMode } from "./compressRules";
 
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url
-).toString();
+pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
 
 // ── Quality Presets ──
 // scale 控制 pdfjs 渲染倍数（1.0 = 72 DPI 原始尺寸）
@@ -27,12 +26,19 @@ const QUALITY = {
 
 export type CompressQuality = "screen" | "ebook" | "printer";
 
+/** 对外重导出（调用方不必知道规则模块的存在） */
+export type { CompressMode };
+
 export interface CompressResult {
   compressed: Uint8Array;
   originalSize: number;
   compressedSize: number;
   savings: number; // percentage 0-100
-  mode: string;
+  /**
+   * - `stage1_lib` / `stage2_raster`：真实压缩成功（`compressed` 是压缩产物）
+   * - `fallback`：未能进一步压缩，`compressed` 就是原文件本身 —— **有效降级不是失败**
+   */
+  mode: CompressMode;
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -77,13 +83,20 @@ async function stage2Rasterize(
 
     try {
       await page.render({ canvasContext: ctx, viewport: vp }).promise;
-    } catch {
-      // 渲染失败保持白页
+    } catch (e: any) {
+      // 渲染失败必须让整页失败 ⇒ 整个 rasterize 失败 ⇒ 回退原文件。
+      // 绝不把白页 / 半渲染页写进产物（那会是不可见的内容丢失）。
+      throw new Error(
+        `[compress] page ${i}/${pageCount} render failed: ${e?.message ?? String(e)}`
+      );
     }
 
-    const blob = await new Promise<Blob>((res) =>
-      canvas.toBlob((b) => res(b!), "image/jpeg", cfg.jpeg)
+    const blob = await new Promise<Blob | null>((res) =>
+      canvas.toBlob((b) => res(b), "image/jpeg", cfg.jpeg)
     );
+    if (!blob) {
+      throw new Error(`[compress] page ${i}/${pageCount} JPEG encode failed (empty blob)`);
+    }
     const jpegBytes = new Uint8Array(await blob.arrayBuffer());
 
     const img = await outDoc.embedJpg(jpegBytes);
@@ -102,8 +115,8 @@ async function stage2Rasterize(
   outDoc.setAuthor("");
   outDoc.setSubject("");
   outDoc.setKeywords([]);
-  outDoc.setProducer("pdfsail");
-  outDoc.setCreator("pdfsail");
+  outDoc.setProducer("pdfaide");
+  outDoc.setCreator("pdfaide");
 
   return await outDoc.save({ useObjectStreams: true, addDefaultPage: false });
 }
@@ -117,9 +130,8 @@ export async function compressPdf(
   quality: CompressQuality = "ebook",
   onProgress?: (pct: number) => void
 ): Promise<CompressResult> {
-  const arrayBuffer =
-    input instanceof File ? await input.arrayBuffer() : input instanceof Uint8Array ? input.buffer : input;
-  const pdfBytes = new Uint8Array(arrayBuffer);
+  // 按视图范围取字节（不能用 view.buffer，否则会把 backing buffer 视图外的字节一起喂给解析器）
+  const pdfBytes = await toPdfBytes(input);
   const originalSize = pdfBytes.length;
   const cfg = QUALITY[quality] || QUALITY.ebook;
 
@@ -154,10 +166,10 @@ export async function compressPdf(
     console.log(`[compress] Stage 2: scale=${cfg.scale}, jpeg=${cfg.jpeg}`);
     const stage2Bytes = await stage2Rasterize(pdfBytes, cfg, onProgress);
 
-    // 如果压缩后反而更大，返回原始文件
+    // 压缩后反而更大 ⇒ 有效 fallback：保留原文件（不是失败，UI 需按 mode 区分）
     const ratio = stage2Bytes.length / originalSize;
-    if (ratio > 1.1) {
-      console.warn(`[compress] Stage 2 output larger (${(ratio * 100).toFixed(0)}%), returning original`);
+    if (decideStage2Outcome(originalSize, stage2Bytes.length) === "fallback") {
+      console.warn(`[compress] Stage 2 no gain (${(ratio * 100).toFixed(0)}%), returning original`);
       if (onProgress) onProgress(100);
       return {
         compressed: pdfBytes,

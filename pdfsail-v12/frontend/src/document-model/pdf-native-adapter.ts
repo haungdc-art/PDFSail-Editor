@@ -226,8 +226,34 @@ function pdfLineToEditableLine(
 
   // 每个 RawGlyph → EditableGlyph
   // Sprint 2：用 PDF Native Style Extractor 提取 glyph 级精确样式
-  line.glyphs.forEach((g) => {
+  // M7.5-002-GAP：pdf.js 把一行拆成多个 text item（各自带绝对 x），adapter 把每个 item 锚定到
+  //   其真实 gCss.x，但 Core Layout 在 visual-line 粒度下对整行做**连续 advance 累加**，
+  //   不会在 item 边界跳到下一个 item 的真实 x。于是 item 之间的真实间距（未必有空格 glyph 承载）
+  //   在 Core 侧丢失 → 整行后续 glyph 累积漂移（如 bg_only l1 空格处 −29px）。
+  //   修复：把 item 间真实 gap 补到「上一个 item 最后一个 glyph」的 advance 上
+  //   （= 该 glyph 到下一 glyph 的真实有效推进量，正是 effective advance contract 的完整语义：
+  //   相邻 glyph 之间的 advance == 真实位移，含 item 间 gap）。仅改 adapter 的 advance 数据，
+  //   不改动 Core Layout 算法结构（§18 仍消费 pdfAdvance）。
+  let prevExpectedEndX: number | null = null;
+  let prevLastGlyph: EditableGlyph | null = null;
+  for (const g of line.glyphs) {
     const gCss = mapper.pdfToCss(g.pdfX, g.pdfY, g.width, g.height);
+
+    // 把上一个 item 末尾到本 item 起点的真实 gap 并入上一 item 最后一个 glyph 的 advance
+    // （gap 可正可负：正 = 词间空格真实留白，负 = 下一个 item 与上 item 重叠/字距回退）。
+    // 仅要求结果 advance 非负（newAdv > -0.5），并以 1000px 上限防跨行/乱序 item 的极端值。
+    if (prevExpectedEndX !== null && prevLastGlyph) {
+      const gap = gCss.x - prevExpectedEndX;
+      const baseAdv =
+        prevLastGlyph.metrics?.pdfAdvance ?? prevLastGlyph.metrics?.advanceWidth ?? 0;
+      const newAdv = baseAdv + gap;
+      if (Number.isFinite(gap) && gap < 1000 && newAdv > -0.5) {
+        prevLastGlyph.bbox = { ...prevLastGlyph.bbox, width: (prevLastGlyph.bbox?.width ?? 0) + gap };
+        if (prevLastGlyph.metrics) {
+          prevLastGlyph.metrics = { ...prevLastGlyph.metrics, pdfAdvance: newAdv, advanceWidth: newAdv };
+        }
+      }
+    }
 
     // M7.8-035-B：用 provenance 表（FontBBox 匹配，非编号猜测）为 glyph 补齐字体溯源。
     // 即使 resolveGlyphFont 因 Form-XObject 字体未被 pageMetrics 收录而失败，
@@ -312,6 +338,12 @@ function pdfLineToEditableLine(
         char: g.str,
         originalChar: g.str,
         bbox: { x: gCss.x, y: gCss.y, width: gCss.w, height: gCss.h },
+        // ★★ D-a-1（P0-2）：import 时刻固化第一手原始字符位置。
+        //   此前 adapter 从不写 originalBBox ⇒ 后续任何 per-glyph mask 的
+        //   `originalBBox ?? bbox` 都退化为「仅新位置」⇒ reload 后原文漏盖（anchor×2）。
+        //   import 时刻 bbox 即原始位置（preserve 语义，同 preserve-layout-engine:176）；
+        //   编辑后 document-mutation 保持 originalBBox 不变 ⇒ original ∪ new 覆盖成立。
+        originalBBox: { x: gCss.x, y: gCss.y, width: gCss.w, height: gCss.h },
         baseline,
         styleRef: glyphStyleRef,
         modified: false,
@@ -320,68 +352,82 @@ function pdfLineToEditableLine(
         // M7.8-035-FIX：此前写成 provenanceCharCode?.pdfCharCode?.get(g.str) —— pdfCharCode 是
         // number 而非 Map，`.get` 不存在 → 每个带 provenance 的 glyph 都抛 TypeError。
         pdfCharCode: provenanceCharCode?.pdfCharCode,
-        metrics: { ...(glyphMetricsExtra ?? {}), ...(provenanceIdentity ?? {}), ...(provenanceCharCode ?? {}), advanceWidth, pdfTransform: g.transform as TransformMatrix } satisfies GlyphMetrics,
+        metrics: { ...(glyphMetricsExtra ?? {}), ...(provenanceIdentity ?? {}), ...(provenanceCharCode ?? {}), pdfAdvance: gCss.w, advanceWidth, pdfTransform: g.transform as TransformMatrix } satisfies GlyphMetrics,
       });
     } else {
       // ── M7.5-002: PDF Native 逐字符 advance（多字符 item） ──
-      // 优先使用 PDF Font Dictionary 真实 Widths（resolveGlyphFont 按「总宽残差」匹配字体），
-      // 分布由真实 advance 决定，整段总宽仍锚定到 pdf.js 真实宽 gCss.w（保持整体不漂移）。
-      // 解析不出真实宽度 → 回退 canvas measureCharWidths（现有能力）。
+      // 优先用 canvas 实测字形宽（= 真实渲染字形宽，与 Legacy GlyphRenderer 一致；
+      // 见本函数头部注释的设计意图），归一化使整段总宽 = 真实 CSS 宽 gCss.w（保持 scale 机制）。
+      // 字体 AFM Widths 作为回退；两者皆不可用则等分 gCss.w。
+      // 分布源改用 canvas：空格等无字距字符的实测宽与 Legacy 渲染一致，避免字体 AFM Widths
+      // 与真实推进量不符导致的逐字累积漂移（如 bg_only l1 空格 −29px 残差）。
       const fm = resolveGlyphFont(pageMetrics, g.str, g.fontSize, g.width);
-      let widthsPt: number[] | null = null;
-      if (fm) {
+      const canvasWidths = measureCharWidths(g.str, lineStyle);
+      let widths: number[] | null = null;
+      let useFontMetrics = false;
+      if (canvasWidths && canvasWidths.length === chars.length &&
+          canvasWidths.every((v) => Number.isFinite(v) && v > 0)) {
+        widths = canvasWidths;
+      } else if (fm) {
         const arr = chars.map((ch) => trueAdvancePt(fm, ch, g.fontSize) ?? NaN);
-        if (arr.every((v) => Number.isFinite(v))) widthsPt = arr;
+        if (arr.every((v) => Number.isFinite(v))) { widths = arr; useFontMetrics = true; }
       }
-
-      if (widthsPt) {
-        // 真实 advance：总宽锚定 gCss.w（CSS px），分布按 PDF native 宽度等比
-        const totalPt = widthsPt.reduce((a, b) => a + b, 0);
-        const scale = totalPt > 0 ? gCss.w / totalPt : 1;
-        let cursorX = gCss.x;
-        chars.forEach((ch, i) => {
-          const w = widthsPt![i] * scale; // tip: scale 抵消 pt→CSS px 的 viewportScale*cssScale
-          const glyphMetrics = glyphMetricsFromFont(fm!, ch, g.fontSize);
-          glyphs.push({
-            char: ch,
-            originalChar: ch,
-            bbox: { x: cursorX, y: gCss.y, width: w, height: gCss.h },
-            baseline,
-            styleRef: glyphStyleRef,
-            modified: false,
-            transform,
-            fontIdentity: provenanceIdentity?.fontIdentity,
-            // 逐字符查 unicode→charCode（CID ≠ Unicode，已用真实 PDF 验证）
-            pdfCharCode: provEntry?.unicodeToCharCode?.get(ch),
-            metrics: { ...glyphMetrics, ...(provenanceIdentity ?? {}), pdfCharCode: provEntry?.unicodeToCharCode?.get(ch), advanceWidth: w, pdfTransform: g.transform as TransformMatrix } satisfies GlyphMetrics,
-          });
-          cursorX += w;
-        });
-      } else {
-        // 回退：canvas 逐字符测量 + 归一化到整段真实宽
-        const widths = measureCharWidths(g.str, lineStyle);
-        const totalMeasured = widths.reduce((a, b) => a + b, 0);
-        const scale = totalMeasured > 0 ? gCss.w / totalMeasured : 1;
-        let cursorX = gCss.x;
-        chars.forEach((ch, i) => {
-          const w = widths[i] * scale;
-          glyphs.push({
-            char: ch,
-            originalChar: ch,
-            bbox: { x: cursorX, y: gCss.y, width: w, height: gCss.h },
-            baseline,
-            styleRef: glyphStyleRef,
-            modified: false,
-            transform,
-            fontIdentity: provenanceIdentity?.fontIdentity,
-            pdfCharCode: provEntry?.unicodeToCharCode?.get(ch),
-            metrics: { ...(provenanceIdentity ?? {}), pdfCharCode: provEntry?.unicodeToCharCode?.get(ch), advanceWidth: w, pdfTransform: g.transform as TransformMatrix } satisfies GlyphMetrics,
-          });
-          cursorX += w;
-        });
+      if (!widths) widths = chars.map(() => gCss.w / chars.length);
+      const totalW = widths.reduce((a, b) => a + b, 0);
+      const scale = totalW > 0 ? gCss.w / totalW : 1; // tip: scale 抵消单位差异
+      // ── RAW-CID-01：逐字符 pdfTransform e 推进（受对账与旋转 fail-closed 保护）──
+      //   根因：多字符 item 的 g.transform 是 item 级（e = 段首 x）⇒ raw 直发逐字符
+      //   绝对 Tm 时全部堆叠在段首。修复：e_i = e_0 + Σ_{j<i} Δx_pt(j)，
+      //   Δx_pt = pdfAdvance(CSS) / totalScale（单位链：Σ pdfAdvance = gCss.w
+      //   = item.width × totalScale ⇒ Σ Δx_pt = item.width，对账容差 0.5pt）。
+      //   fail-closed：旋转/倾斜（b/c 非零）或对账失败 ⇒ 保持 item 级 transform 现状。
+      const rawTr = g.transform as number[] | undefined;
+      const rotated = !!rawTr && (Math.abs(rawTr[1] ?? 0) > 1e-6 || Math.abs(rawTr[2] ?? 0) > 1e-6);
+      // 单位链（对账确立）：gCss.w = item.width × renderScale（import 几何链，
+      // 与 SCALE-MISMATCH-01 一致）⇒ Δx_pt = pdfAdvance(CSS) / renderScale。
+      // renderScale 由第一手数据推导（gCss.w / g.width），不依赖 mapper 内部结构。
+      const itemWidthPt = Number.isFinite(g.width) && g.width > 0 ? g.width : NaN;
+      const advTotal = Number.isFinite(itemWidthPt) ? gCss.w / itemWidthPt : NaN;
+      const sumAdvancePt = advTotal > 0 ? (widths.reduce((a, b) => a + b, 0) * scale) / advTotal : NaN;
+      const reconciled = Number.isFinite(sumAdvancePt) && Math.abs(sumAdvancePt - itemWidthPt) <= 0.5;
+      const perCharE = !rotated && reconciled;
+      if (!perCharE && chars.length > 1) {
+        console.log(`[RAW-CID-01] item 保持现状（e 不推进）: str="${g.str.slice(0, 12)}" rotated=${rotated} 对账=${reconciled} (Σ=${sumAdvancePt?.toFixed(2)}pt vs item=${itemWidthPt?.toFixed(2)}pt)`);
       }
+      const e0 = rawTr ? rawTr[4] : 0;
+      let accX = 0;
+      let cursorX = gCss.x;
+      chars.forEach((ch, i) => {
+        const w = widths![i] * scale; // 单字符 effective advance（归一化到 gCss.w）
+        const glyphMetrics = useFontMetrics ? glyphMetricsFromFont(fm!, ch, g.fontSize) : undefined;
+        // e 推进：首字符保持 e0；后续按累计 PDF pt advance（仅对账通过且非旋转）
+        const charTransform: TransformMatrix = perCharE && rawTr
+          ? ([rawTr[0], rawTr[1], rawTr[2], rawTr[3], e0 + accX, rawTr[5]] as TransformMatrix)
+          : (g.transform as TransformMatrix);
+        accX += w / advTotal;
+        glyphs.push({
+          char: ch,
+          originalChar: ch,
+          bbox: { x: cursorX, y: gCss.y, width: w, height: gCss.h },
+          // ★★ D-a-1（P0-2）：同上 —— import 时刻固化第一手原始字符位置
+          originalBBox: { x: cursorX, y: gCss.y, width: w, height: gCss.h },
+          baseline,
+          styleRef: glyphStyleRef,
+          modified: false,
+          transform,
+          fontIdentity: provenanceIdentity?.fontIdentity,
+          // 逐字符查 unicode→charCode（CID ≠ Unicode，已用真实 PDF 验证）
+          pdfCharCode: provEntry?.unicodeToCharCode?.get(ch),
+          metrics: { ...(glyphMetrics ?? {}), ...(provenanceIdentity ?? {}), pdfCharCode: provEntry?.unicodeToCharCode?.get(ch), pdfAdvance: w, advanceWidth: w, pdfTransform: charTransform } satisfies GlyphMetrics,
+        });
+        cursorX += w;
+      });
     }
-  });
+
+    // 记录本 item 终点与末 glyph，供下一 item 计算 inter-item gap 并入末 glyph advance
+    prevExpectedEndX = gCss.x + gCss.w;
+    prevLastGlyph = glyphs[glyphs.length - 1] ?? prevLastGlyph;
+  }
 
   return {
     line: {

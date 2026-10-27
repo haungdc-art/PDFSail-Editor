@@ -54,6 +54,36 @@ export function transformMatrixToAngle(transform: TransformMatrix): number {
 }
 
 /**
+ * F3B-6.18-C.1：`[a,b,c,d]` → 顺时针角度（度）。与 {@link transformMatrixToAngle} 同规则。
+ */
+export function transform4ToAngle(t: readonly [number, number, number, number]): number {
+  return (Math.atan2(t[1], t[0]) * 180) / Math.PI;
+}
+
+/**
+ * F3B-6.18-C.1：取 block 内**首个非单位** glyph.transform 的归一化仿射分量 `[a,b,c,d]`。
+ *
+ * 这是「旋转/倾斜」的唯一原始事实（PDF text matrix 归一化后的 4 分量；平移由 bbox 承担）。
+ * 无任何旋转/倾斜时返回 `null`（等价单位矩阵）。
+ *
+ * {@link resolveBlockRotation} 的 Priority 3 由本函数派生，保证两者**同源**。
+ */
+export function resolveBlockTransformMatrix(block: {
+  lines: Array<{ glyphs: Array<{ transform?: TransformMatrix }> }>;
+}): [number, number, number, number] | null {
+  for (const line of block.lines) {
+    for (const g of line.glyphs) {
+      const t = g.transform;
+      if (!t) continue;
+      if (t[0] !== 1 || t[1] !== 0 || t[2] !== 0 || t[3] !== 1) {
+        return [t[0], t[1], t[2], t[3]];
+      }
+    }
+  }
+  return null;
+}
+
+/**
  * resolveBlockRotation — Authoritative Rotation Resolution API。
  *
  * 返回一个 Block 当前应采用的**权威视觉旋转角度**（度，顺时针为正）。
@@ -94,17 +124,9 @@ export function resolveBlockRotation(block: {
     return geomRot;
   }
 
-  // Priority 3: glyph.transform（当前 Provider）
-  // 取该 block 第一个非单位矩阵的 glyph.transform 角度；全部单位矩阵 → 继续 fallback。
-  for (const line of block.lines) {
-    for (const g of line.glyphs) {
-      const t = g.transform;
-      if (!t) continue;
-      if (t[0] !== 1 || t[1] !== 0 || t[2] !== 0 || t[3] !== 1) {
-        return transformMatrixToAngle(t);
-      }
-    }
-  }
+  // Priority 3: glyph.transform（当前 Provider）—— 与 resolveBlockTransformMatrix **同源**
+  const matrix = resolveBlockTransformMatrix(block);
+  if (matrix) return transform4ToAngle(matrix);
 
   // fallback: 0
   return 0;

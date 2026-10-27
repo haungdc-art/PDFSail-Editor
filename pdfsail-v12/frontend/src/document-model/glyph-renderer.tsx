@@ -30,6 +30,7 @@ import type {
 import type { EditableStyle, BBox } from "./types";
 import type { ViewRenderingMode } from "./view-mode";
 import { groupCommands } from "./render-command";
+import { buildGlyphDecorations } from "./glyph-decoration";
 import { RenderLayer } from "./render-layer";
 import {
   buildTextFlow,
@@ -115,6 +116,18 @@ export interface GlyphRendererProps {
    *  commit 后 mask 用它盖住原扫描文字（而非过窄的 OCR 墨迹盒）。 */
   editedLines?: ReadonlySet<string>;
   editedLineBoxes?: Map<string, BBox>;
+  /**
+   * F3B-6.4B-P2-A: **当前 page 的文档 line identity**（`EditablePage.blocks[].lines[].id`）。
+   *
+   * 为什么需要它：mask identity matching 原先**只**看 `commands` 派生的 line id，
+   * 而「整行清空」后该行 `glyphs = []` ⇒ **0 条 RenderCommand** ⇒ 该行 id 消失
+   * ⇒ B-6.1 已算好的 `editedLineBoxes` box **存在但不可达** ⇒ 原 PDF 墨迹继续显示（P2）。
+   *
+   * 语义：与 `commands` 派生的 id **取并集**，共同构成
+   * 「当前页上**可参与 mask identity matching** 的 line ids」。
+   * 多页隔离不受影响 —— 传进来的必须**只有当前页**的行 id（M7.7-006D）。
+   */
+  documentPageLineIds?: ReadonlySet<string>;
 }
 
 /**
@@ -126,6 +139,53 @@ export interface GlyphRendererProps {
  *   - 选中高亮（蓝色边框）
  *   - 拖拽选择框
  */
+
+// F3B-6.21-H1-C2: 字形装饰（下划线 / 删除线）渲染。
+// 装饰只来自 Core TextStyle（经 toEditableStyle 透传进 EditableStyle）；定位只来自 glyph box
+// （本组件每个 glyph 的 span 盒本身就是 box，故装饰用 box 相对百分比定位：下划线 = box 底部，
+// 删除线 = box 中部），绝不引入 font metric / canvas 测量 / renderer-local magic offset。
+// 装饰作为 span 子元素，自动跟随 block（含旋转）变换与 span 盒尺寸。
+function GlyphDecorationNodes({ style }: { style?: EditableStyle }): React.ReactNode {
+  const decos = buildGlyphDecorations(style);
+  if (decos.length === 0) return null;
+  return (
+    <>
+      {decos.map((d) =>
+        d.kind === "underline" ? (
+          <span
+            key="decoration-underline"
+            data-decoration="underline"
+            style={{
+              position: "absolute",
+              left: 0,
+              width: "100%",
+              bottom: 0,
+              height: `${d.thickness}px`,
+              background: d.color,
+              pointerEvents: "none",
+            }}
+          />
+        ) : (
+          <span
+            key="decoration-strike"
+            data-decoration="strike"
+            style={{
+              position: "absolute",
+              left: 0,
+              width: "100%",
+              top: "50%",
+              transform: "translateY(-50%)",
+              height: `${d.thickness}px`,
+              background: d.color,
+              pointerEvents: "none",
+            }}
+          />
+        )
+      )}
+    </>
+  );
+}
+
 export function GlyphRenderer({
   commands,
   styles,
@@ -146,6 +206,7 @@ export function GlyphRenderer({
   viewMode = "legacy-glyph",
   editedLines,
   editedLineBoxes,
+  documentPageLineIds,
 }: GlyphRendererProps) {
   // console.log("[M7.7-015][RENDER]", {
   //   commandsLen: commands.length,
@@ -222,15 +283,27 @@ export function GlyphRenderer({
     }
   }, [commands, editedLines, editingLineId, isNativeCanvas]);
   const { glyphs, lines, rects, images } = useMemo(() => groupCommands(commands), [commands]);
-  // M7.7-006D: 多页状态隔离 — 只渲染当前页有的 editedLineBoxes 条目，
-  // 防止 page 1 的 mask 泄漏到 page 2
+  // M7.7-006D + F3B-6.4B-P2-A:
+  //   `pageLineIds` = **当前 page 上可参与 mask identity matching 的 line ids**
+  //   = commands 派生的 id ∪ 当前页**文档**的 line id（`documentPageLineIds`）
+  //
+  // 语义修正（P2）：原先它只表示「当前 page 上**存在 RenderCommand** 的 line ids」，
+  //   而「整行清空」后该行 0 条命令 ⇒ 身份消失 ⇒ mask gate 拦掉 B-6.1 已算好的 box
+  //   ⇒ 原墨迹继续可见。join 文档身份后，**空行仍有身份**。
+  //
+  // 多页隔离仍成立：`documentPageLineIds` 由调用方**只传当前页**的行 id
+  //   ⇒ 仍只渲染当前页有的 editedLineBoxes 条目，防止 page 1 的 mask 泄漏到 page 2。
   const pageLineIds = useMemo(() => {
     const ids = new Set<string>();
     for (const cmd of commands) {
       if ("lineId" in cmd && cmd.lineId) ids.add(cmd.lineId);
     }
+    // P2-A: 补上「当前页文档」的 line identity（空行没有命令，但仍是这一页的行）
+    if (documentPageLineIds) {
+      for (const id of documentPageLineIds) ids.add(id);
+    }
     return ids;
-  }, [commands]);
+  }, [commands, documentPageLineIds]);
   // M7.7-004 (Bug1): 正在编辑行的 bbox（该 block 中 lineId===editingLineId 的 glyph 并集）。
   //   block 级 mask 会盖住同 block 的其他行；编辑态只应遮盖编辑行本身（textarea 已覆盖它），
   //   mask 裁剪到该行 bbox 后，其他行保持 canvas 原文可见。
@@ -1233,6 +1306,7 @@ export function GlyphRenderer({
                       }}
                     >
                       {cmd.char}
+                      <GlyphDecorationNodes style={styles[cmd.styleRef]} />
                     </span>
                   ) : null;
                 })}
@@ -1407,6 +1481,7 @@ export function GlyphRenderer({
                       }}
                     >
                       {cmd.char}
+                      <GlyphDecorationNodes style={styles[cmd.styleRef]} />
                     </span>
                   ) : null;
                 })}
@@ -1632,6 +1707,7 @@ export function GlyphRenderer({
                   }}
                 >
                   {cmd.char}
+                  <GlyphDecorationNodes style={styles[cmd.styleRef]} />
                 </span>
               );
             }
@@ -1678,14 +1754,4 @@ export function GlyphRenderer({
       )}
     </div>
   );
-}
-
-/**
- * 便捷方法：从 EditableDocument 直接渲染某一页的 glyph
- */
-export function renderPageGlyphs(
-  commands: RenderCommand[],
-  styles: EditableStyle[]
-): React.ReactElement {
-  return <GlyphRenderer commands={commands} styles={styles} />;
 }

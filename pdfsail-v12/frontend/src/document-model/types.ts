@@ -108,6 +108,17 @@ export interface EditableStyle {
   fontWeight?: string | number;
   /** CSS font-style（"normal" | "italic" | "oblique"） */
   fontStyle?: "normal" | "italic" | "oblique";
+  /**
+   * 下划线（V1 format capability；由 Editor Core `TextStyle.underline` 经
+   * `render-command-bridge.ts` 的 `toEditableStyle` 透传）。
+   * 缺省 undefined（不写 false）；renderer 据此在 glyph box 底部绘制下划线。
+   */
+  underline?: boolean;
+  /**
+   * 删除线（V1 format capability；来源同 underline）。
+   * 缺省 undefined（不写 false）；renderer 据此在 glyph box 中部绘制删除线。
+   */
+  strike?: boolean;
   /** CSS color（"#RRGGBB"） */
   color?: string;
   /** 行高（CSS px 或无单位倍数；导出时按需转换） */
@@ -159,8 +170,19 @@ export interface EditableStyle {
  *   - 只保留编辑需要的原始指标
  */
 export interface GlyphMetrics {
-  /** PDF 原始 advance width（CSS px，字符前进宽度，决定下一字符 x 偏移） */
+  /** PDF 原始 advance width（CSS px，字符前进宽度，决定下一字符 x 偏移）。
+   *  注意：单字符分支在 `resolveGlyphFont` 命中时会被改写为「字体名义 advance」（AFM），
+   *  多字符分支则锚定到内容流真实宽。因此本字段语义不统一。 */
   advanceWidth: number;
+  /**
+   * PDF 内容流**实际有效**推进量（CSS px）。
+   * = `gCss.w`（单字符 item）/ 锚定到 `gCss.w` 的等比分布（多字符 item）。
+   * 与 `advanceWidth` 的区分：本字段始终是 PDF 内容流的真实横向占位，
+   * 而 `advanceWidth` 在单字符分支可能是「字体名义 advance」。
+   * Core Layout 应消费 `pdfAdvance` 以复现 PDF.js 的真实 glyph 位置；
+   * 缺省回退到 `advanceWidth`。
+   */
+  pdfAdvance?: number;
   /** PDF text state: char spacing（pt，可选） */
   charSpacing?: number;
   /** PDF text state: word spacing（pt，可选） */
@@ -339,6 +361,18 @@ export interface EditableGlyph {
     /** PDF 原始字符码（raw Type3/CID char code；M7.8-035-FIX：导出直接发 Tj，不经 Unicode→CID）。 */
     pdfCharCode?: number;
     /**
+     * ★★ P0-1 · PDF 原始文本矩阵（raw CID 直发的第二事实，与 `pdfCharCode` 同生共死）。
+     *
+     * 与 `metrics.pdfTransform` 的区别（架构约束，Step 5A/5B 契约）：
+     *   编辑行 glyph.metrics **必须**保持 fail-closed 空（isMeasuredOnly），
+     *   但 raw-CID 直发（emitRawCidGlyphs）需要 cid+transform **成对**的第一手事实。
+     *   ⇒ 本字段由 Binding 层经 Sidecar provenance **显式注入**（对齐未变更原字符），
+     *     缺失 ⇒ 缺省（绝不伪造、绝不猜 CID）。
+     *
+     * PDF 用户空间矩阵 [a, b, c, d, e, f]（与 metrics.pdfTransform 同一坐标系）。
+     */
+    pdfTransform?: TransformMatrix;
+    /**
      * M7.8-036-FIX-002 · Original PDF Operator Provenance。
      *
      * 导入期即把本 glyph 钉死到原 PDF 的某个 showText 算子及其内部第几个 charCode：
@@ -366,6 +400,34 @@ export interface EditableGlyph {
  */
 export type RenderSource = "vector" | "image" | "image-ocr";
 
+/**
+ * F3B-6.28 · D-3B-1：重绘几何载荷（诊断期；3B-2 前不参与写入）。
+ *
+ * 刻意定义为**无依赖的纯数据形状**（不含 Binding 类型）⇒ document-model 不反向
+ * 依赖 editor/binding。坐标域 = PDF pt（与 `pdfTransform` 同域）。
+ */
+export interface LineRedrawGeometry {
+  readonly role: "flow-member" | "displaced-successor";
+  /** flow 行序（位移行 ⇒ null） */
+  readonly flowIndex: number | null;
+  readonly sourceLineIds: readonly string[];
+  readonly text: string;
+  readonly box: { readonly x: number; readonly y: number; readonly width: number; readonly height: number };
+  readonly baselinePt: number;
+  /** 该行垂直位移（CSS px，向下为正） */
+  readonly deltaCss: number;
+  readonly glyphs: readonly {
+    readonly char: string;
+    readonly sourceLineId: string;
+    readonly sourceGlyphIndex: number | null;
+    readonly pdfCharCode: number | null;
+    readonly fontRef: string | null;
+    readonly pdfTransform: readonly number[] | null;
+    readonly targetXPt: number;
+    readonly targetBaselinePt: number;
+  }[];
+}
+
 export interface EditableLine {
   id: string;
   /**
@@ -391,6 +453,35 @@ export interface EditableLine {
    * 缺省 "vector"（向后兼容：现有文档模型无此字段时视为矢量文字）。
    */
   source: RenderSource;
+  /**
+   * F3B-6.28 · D-3B-1：重绘几何载荷（**诊断期惰性字段**）。
+   *
+   * 由 Binding 侧 `runExportRedrawPipeline` 产出、经 bridge 的 `lineRedrawOf` 挂载。
+   * 3B-1 阶段它只是让「目标几何」随行可观测（逐行诊断），不参与任何写入决策。
+   * = `redrawLines[0]`（3B-2 起两字段同源，本字段保留为 3B-1 诊断/守卫的既有形状）。
+   */
+  redrawGeometry?: LineRedrawGeometry | null;
+  /**
+   * F3B-6.28 · D-3B-2：**该 legacy 行需要重绘的全部目标行**（通常 >1：unit 成员行
+   * 被 flow 重排后可能独占多条视觉行，如 l5 原文 32 字一行 + 追加内容溢出一条）。
+   *
+   * 由 bridge 的 `lineRedrawOf`（返回数组）挂载；**未挂载（undefined/空）时导出渲染器
+   * 必须走既有路径**，逐字节不变。
+   *
+   * ⚠️ 写入资格纪律（用户 2026-10-14）：本字段是重绘的**唯一**入口，
+   *   不得通过改写 `glyph.modified`、放宽 raw-CID 检查等隐式方式开启重绘；
+   *   它只在「unit 编辑计划有效（真实事务 + 事务水位未失效）」时由 Binding 注入。
+   */
+  redrawLines?: readonly LineRedrawGeometry[] | null;
+  /**
+   * F3B-6.28 · D-3B-2：本行属于**已被重绘覆盖**的 Core 段落。
+   *
+   * 一个被编辑的 Core 段落常被 bridge 拆成多条视觉行：承载来源 lineId 的那条拿到
+   * `redrawLines`，其余（generated run，无 lineId ⇒ 合成 id）不拿几何 —— 但它们的
+   * 文字已由 flow 重绘（在同一个段落坐标系里）画出。若不标记，这些行会走既有
+   * overlay 再画一遍 ⇒ **正文重复**（实测：追加内容前 8 字在错误 baseline 上多画一次）。
+   */
+  redrawCovered?: boolean;
   /** 行 bbox（CSS 显示坐标，View Fact / Derived） */
   bbox: BBox;
   /**
@@ -406,6 +497,19 @@ export interface EditableLine {
    * 被替换子串的原始 bbox，导出时逐段生成白色 mask，既盖住所有旧文字、又保留段间表格线。
    */
   editedOriginalBounds?: BBox[];
+  /**
+   * M7.9-ORPHAN-FIX：缩短编辑中被丢弃原 glyph 的 operatorId（去重、跨次累加）。
+   *
+   * 当新文本比原选区短（如 "100%" → "99%"）时，原选区 [start, end] 内超出新文本长度的
+   * 尾部原 glyph 不会被映射到任何新 glyph，因而随新 glyph 数组一起消失 —— 其
+   * `operatorId` 也随之丢失。而导出的 `stripReplacedTextOperators` 只从
+   * `line.glyphs[].operatorId` 收集待剥离算子，这些「孤儿算子」永远收集不到
+   * → 原 PDF 文本（如末尾 "%"）残留在 content stream 中，与新绘制文本叠加成重影。
+   *
+   * 本字段由 `mutateLineText` 累加（表格多列会按 segment 多次编辑，故为数组语义），
+   * 导出时并入剥离集合，使孤儿算子同样被移除。
+   */
+  droppedOperatorIds?: string[];
   /**
    * 行基线（Original Fact，Milestone-1 Baseline Fidelity）。
    *
@@ -440,18 +544,29 @@ export interface EditableLine {
    */
   edited?: boolean;
   /**
-   * M7.8-042-ORPHAN：编辑使行变短时（如 "100%"→"99%"）被删除的原 glyph 的 operatorId 列表。
+   * ★ Step 5B：**export-facing** 的「本行原始 PDF 字体身份」（行级 provenance）。
    *
-   * 根因：range mutation 逐位对齐（新[i] ← 原[start+i]），replacement 比原选区短时，
-   * 尾部原 glyph（如第三个 "0" 后的 "%"）被丢弃 —— 其 operatorId 随 glyph 一起消失，
-   * export 的 stripReplacedTextOperators 按 glyph.operatorId 收集不到该算子 →
-   * 原 "%" 算子残留在 content stream → 导出重影（实测 x=412.4 处孤立 "%"）。
+   * ⚠️ 与 `glyph.metrics.fontIdentity` 是**两种不同的东西**，不可互换：
+   *   · `glyph.metrics.fontIdentity` = **glyph 级测量 provenance**（该 glyph 的
+   *     advanceWidth / pdfTransform / pdfCharCode 等度量上下文的一部分）。
+   *   · 本字段 = **行级 export provenance**：回答「这条被编辑/替换的 PDF 原始文本行，
+   *     重绘时应该优先用哪个原字体」。
    *
-   * 由 mapNewTextToOriginalGlyphs 收集（GlyphMappingResult.droppedOperatorIds）、
-   * mutateLineText 累加合并到行、导出剥离时并入该行的剥离集合。
-   * 为数组：同一行多次变短编辑会各产生一批孤儿算子，需累加去重。
+   * 为什么必须是行级、且不能塞进 `glyph.metrics`：
+   *   Core 的 `stripGlyphRange`（§25）会在 run 被编辑后清除其 glyph 索引，于是
+   *   `run.source.startGlyphIndex/endGlyphIndex` 消失 ⇒ glyph 级 metrics 无法回溯 ⇒
+   *   编辑行的 `glyph.metrics` 天然为空。但 `blockId/lineId` 仍保留，
+   *   所以「这一行原本用哪个内嵌字体」是可以确定回答的。
+   *
+   * ⚠️ 边界（Step 5B 硬约束）：
+   *   · **只**由 export 侧的 CID/非 WinAnsi 重绘路径消费；
+   *   · **不**参与 `isMeasuredOnly` 判定，因此不会把普通 WinAnsi 行踢出
+   *     「整行单次 drawText」（M7.8-0XX 字距修复）路径；
+   *   · **不**参与 native replay / 逐 glyph Standard-14 路径。
+   *
+   * 由 Core→Legacy bridge 从 BindingSidecar 的行绑定派生（缺省不注入 ⇒ 行为不变）。
    */
-  droppedOperatorIds?: string[];
+  originalFontIdentity?: GlyphFontIdentity;
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -581,6 +696,12 @@ export interface EditableBlock {
   lines: EditableLine[];
   /** 图片 src（type="image" 时） */
   src?: string;
+  /**
+   * B3-C-5-C：Core 图片资产（Binding 经 assetRef 解析后的原始字节，非 src/URL）。
+   * 与 `src` 互斥——本字段走 Core export 路径，由 `pdf-export-bridge` 在桥接期注入，
+   * 不经由 URL fetch，也不进入 Core（`ImageObject` 仅持 assetRef）。
+   */
+  image?: { bytes: Uint8Array; mime: string };
   /** 布局模式（Sprint 3.5）：preserve 保持原布局，reconstruct 重建布局 */
   layoutMode?: LayoutMode;
   /**

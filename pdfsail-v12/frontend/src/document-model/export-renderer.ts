@@ -22,6 +22,10 @@
  * 不修改现有 export-pdf.ts（保留作为 fallback）。
  */
 
+import { isExportScaleAlignEnabled } from "./export-scale-align";
+import { isFallbackBaselineAlignEnabled, resolveBaseCssY } from "./export-fallback-baseline-align";
+import { isRawFallbackDirectBaselineEnabled, resolveDirectRawPdfY, isValidPdfTransform } from "./export-raw-fallback-direct-baseline";
+
 import {
   PDFDocument,
   PDFName,
@@ -31,6 +35,8 @@ import {
   PDFRawStream,
   PDFStream,
   PDFNumber,
+  PDFOperator,
+  PDFOperatorNames,
   decodePDFRawStream,
   rgb,
   degrees,
@@ -38,6 +44,10 @@ import {
   type PDFFont,
   type PDFPage,
 } from "pdf-lib";
+import { assembleCidFont } from "./export-cid-font";
+// Step 5B：CID 路径复用既有 resolver 拿「该行原 PDF 内嵌字体」字节
+// （不新建 embedded-font loader / cache，也不手写字节抽取）。
+import { resolveFont, type ResolvedFont } from "./export-font-resolver";
 import {
   calculateReplacementMaskBounds,
   resolveVisualCoverageBounds,
@@ -52,20 +62,25 @@ import type {
   BBox,
   SignatureRenderRegion,
   GlyphFontIdentity,
+  LineRedrawGeometry,
 } from "./types";
 import type {
   ExportCommand,
   DrawTextGlyphCommand,
   DrawLineCommand,
   DrawImageCommand,
+  DrawRedrawLineCommand,
 } from "./export-command";
 import { groupExportCommands } from "./export-command";
 // M7.8-035-FIX-5：复用已有的内容流解析/补丁能力做「文本层语义修复」
 import {
+  makeFontDictResolver,
   resolvePageShowTextWithXObjects,
   tokenizeContentStream,
   type TextShowRecord,
 } from "./content-stream-resolver";
+// F3B-6.28 · D-3B-7：编辑字符的**原字体**一致性 —— 原字体 /ToUnicode 反查（Unicode → CID）
+import { buildReverseToUnicodeMap, reverseCidOf } from "./export-font-cid-reverse";
 import { patchContentStream, computeRangeChecksum } from "./content-stream-patch";
 import {
   filterOverlayForNativeReplaced,
@@ -78,6 +93,10 @@ import { defaultExportStrategySelector } from "./export-strategy";
 import type { ExportRequirements } from "./export-strategy";
 import { analyzeMaskImpact, blockLineInkBands } from "./export-impact-analysis";
 import { emitRawCidGlyphs, emitNativeTextRun } from "./export-raw-cid-font";
+import {
+  splitOriginalRawRuns,
+  classifyGlyphForExport,
+} from "./export-original-raw-split";
 
 // Sprint40-fix（bug 3 通用修复）：Standard 14 回退字体缓存，避免逐 glyph 重复嵌入。
 const stdFontCache = new Map<string, PDFFont>();
@@ -88,28 +107,31 @@ import {
 } from "./pdf-font-provenance";
 import type { TransformMatrix } from "./types";
 import fontkit from "fontkit";
+// F3B-6.28 · D-3B-4：重绘写入资格门（清除完整性核验 + 拒绝型错误）
+import {
+  ExportRedrawGateError,
+  collectShowTextOpsFromStream,
+  findIncompletelyClearedLines,
+  type StreamOpLike,
+} from "./export-redraw-verify";
 
-/** 导出上下文（坐标转换参数） */
-export interface ExportContext {
-  /** PDF 渲染 scale（通常 1.5） */
-  renderScale: number;
-  /** CSS 显示缩放（canvas.clientWidth / canvas.width） */
-  cssScale: number;
-  /** 页面高度（PDF pt，用于 Y 翻转） */
-  pageHeightPt: number;
-  /**
-   * M7.8-035-FIX-4：页面**顶部**的 PDF 纵坐标（= MediaBox.y1），Y 翻转的真正基准。
-   *
-   * 导入侧 CoordinateMapper.pdfYToCssY 用的是 `originYDevice = vp.transform[5]`
-   * = MediaBox.y1 × scale，即 CSS 原点在 **y1**（不是 y0）。
-   * 而这里 pageHeightPt = page.height / scale = MediaBox.**height** = y1 − y0。
-   * 当 MediaBox.y0 ≠ 0 时两者相差 y0，导出翻转会把内容整体下移 y0：
-   *   - 文字走原生重放（直接用原始 pdfTransform）→ 位置仍正确；
-   *   - mask 走 cssToPdf → 位置偏移 y0 → 擦到下一行 / 漏掉旧文字。
-   * 缺省时回退 pageHeightPt，保证 y0 === 0 的 PDF 行为完全不变。
-   */
-  pageTopPt?: number;
-}
+/**
+ * 导出上下文（坐标转换参数）与 CSS→PDF 换算已抽到**中立纯模块**
+ * `./export-coordinate-space`（F3B-6.28 · D-3B-2：Binding 层受 012-B 边界守卫约束
+ * 不得 import 本文件，但重绘几何必须与这里使用同一套坐标口径）。
+ * 此处 re-export 保持既有消费方（export-impact-analysis / export-scale-align /
+ * CoordinateMapper / 各测试）的导入面不变。
+ */
+export { cssToPdf, cssToPdfX } from "./export-coordinate-space";
+// F3B-6.28 · D-3B-4：document-space 契约（重绘几何专用；legacy overlay 契约不变）
+export { cssToPdfXDocumentSpace } from "./export-coordinate-space";
+export type { ExportContext } from "./export-coordinate-space";
+import {
+  cssToPdf,
+  cssToPdfX,
+  cssToPdfXDocumentSpace,
+  type ExportContext,
+} from "./export-coordinate-space";
 
 /**
  * M7.7-006: mask 安全扩展（CSS 显示坐标）。
@@ -167,6 +189,30 @@ function readStreamText(pdf: PDFDocument, ref: PDFRef): string | null {
     }
   }
   return null;
+}
+
+/**
+ * F3B-6.28 · D-3B-4：提取某页内容流里的全部 showText 算子（`(y, text)` 对）。
+ *
+ * 只服务「重绘前清除完整性核验」：判断某行原始 baseline 附近是否还有**非空**算子。
+ * y 为 **CTM 合成后的有效 PDF 空间 y**（与 Sidecar `pdfTransform[5]` 同坐标系）；
+ * 解析与剥离口径同源（同一 tokenizer、同一类算子形态）。
+ *
+ * ★ 历史缺陷（2026-10-19 修复）：旧实现用正则直取原始 Tm 的 f 分量，页面带
+ *   y 翻转 cm 时与有效 y 差一个镜像 ⇒ 在镜像位置假阳性（详见
+ *   `collectShowTextOpsFromStream` 头注与 export-redraw-verify.ts）。
+ */
+function collectShowTextOps(pdf: PDFDocument, page: PDFPage): StreamOpLike[] {
+  const contents = page.node.get(PDFName.of("Contents"));
+  if (!contents) return [];
+  const refs = contents instanceof PDFArray ? contents.asArray() : [contents];
+  const ops: StreamOpLike[] = [];
+  for (const ref of refs) {
+    const text = readStreamText(pdf, ref as unknown as PDFRef);
+    if (text === null) continue;
+    for (const op of collectShowTextOpsFromStream(text)) ops.push(op);
+  }
+  return ops;
 }
 
 function writeStreamText(pdf: PDFDocument, ref: PDFRef, text: string): void {
@@ -323,6 +369,8 @@ async function stripReplacedTextOperators(
   doc: EditableDocument,
 ): Promise<StripResult> {
   let stripped = 0;
+  // [STRIP-B2] 临时诊断计数器（可移除；仅观察，不改变逻辑）
+  let writeBackCount = 0;
   /** 成功剥离的 operatorId */
   const strippedOps = new Set<string>();
   /** 行 → 该行待剥离的 operatorId 集合（用于判定「整行是否剥离干净」） */
@@ -334,10 +382,22 @@ async function stripReplacedTextOperators(
   //    provenance 由导入期钉定（glyph.operatorId / operatorCharIndex），此处只消费、不再猜测。
   for (let pageIdx = 0; pageIdx < doc.pages.length; pageIdx++) {
     const page = doc.pages[pageIdx];
-    if (pageIdx < 0 || pageIdx >= pdf.getPageCount()) continue;
+    // ★ 2026-10-22：strip 的 PDF 页定位 = **page.index - 1**（0-based PDF 页号）。
+    //   **不能用数组下标**——懒加载子文档（pages=[第1页,第11页]）的下标 1 会把
+    //   第 11 页的算子剥离落到 PDF 第 2 页 ⇒ 旧文字残留、重绘与之叠画。全量文档
+    //   （index = 下标+1）二者等价 ⇒ 行为不变。缺 index ⇒ 退回下标（fail-open）。
+    const pdfPageIdx =
+      typeof (page as { index?: unknown }).index === "number" &&
+      Number.isFinite((page as { index: number }).index) &&
+      (page as { index: number }).index >= 1
+        ? (page as { index: number }).index - 1
+        : pageIdx;
+    if (pdfPageIdx < 0 || pdfPageIdx >= pdf.getPageCount()) continue;
 
     const opIds = new Set<string>();
 
+    // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+    console.log("[STRIP-B2] A-doc-traversal start", { pageIdx, pdfPageIdx });
     for (const block of page.blocks) {
       for (let li = 0; li < block.lines.length; li++) {
         const line = block.lines[li];
@@ -370,40 +430,44 @@ async function stripReplacedTextOperators(
             lineOpIds.set(key, set);
           }
         }
-        // M7.8-042-ORPHAN：变短编辑（如 "100%"→"99%"）丢弃的原 glyph 算子也必须剥离。
-        // 这些「孤儿算子」不在任何现存 glyph 上（glyph 已被删除），但原算子仍留在
-        // content stream 里 → 不收集则原字符残留成重影（实测孤立 "%"）。
-        if (isEditedLine && line.droppedOperatorIds?.length) {
-          for (const dropId of line.droppedOperatorIds) {
-            if (!dropId) continue;
-            opIds.add(dropId);
+
+        // M7.9-ORPHAN-FIX：并入「缩短编辑中被丢弃原 glyph」的孤儿算子。
+        // 这些算子承载的原文仍留在 content stream 中，但其对应原 glyph 已不在
+        // line.glyphs 里（新文本更短时被丢弃，如 "100%"→"99%" 的尾部 "%"），
+        // 故上面遍历 line.glyphs 的循环永远收集不到它们 → 不剥离 → 旧文字与新绘制
+        // 文本叠加成重影。行级 droppedOperatorIds 由 mutateLineText 累加，此处消费。
+        //
+        // ★ F3B-6.28 · D 第一阶段：**不再要求 isEditedLine**。
+        //   `droppedOperatorIds` 的语义是「这一行的这些原算子必须被移除」的显式清单。
+        //   段落重排会推移**后续原始行**（文本未变、未被标记 edited），Binding 投影
+        //   （affected-source-projection 的 displacedLines）把它们登记进来 ⇒ 其旧位置
+        //   原算子必须剥离，否则位移后新旧文字重叠（D2 实测：l7..l20 全不位移 + 注入行叠字）。
+        //   legacy 路径（mutateLineText 写入）本就在 edited 行上，行为不变；
+        //   非编辑行此前该字段恒空 ⇒ 本次放开只影响 Binding 的显式声明。
+        if (line.droppedOperatorIds?.length) {
+          for (const id of line.droppedOperatorIds) {
+            opIds.add(id);
             const set = lineOpIds.get(key) ?? new Set<string>();
-            set.add(dropId);
+            set.add(id);
             lineOpIds.set(key, set);
           }
         }
       }
     }
+    // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+    console.log("[STRIP-B2] A-doc-traversal done", { opIds: opIds.size, lines: lineOpIds.size });
     // ② 本页算子记录（streamRef 分组 / 文本匹配兜底）
     let metaRecords: TextShowRecord[] = [];
+    // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+    console.log("[STRIP-B2] B-resolvePageShowTextWithXObjects start");
     try {
-      metaRecords = resolvePageShowTextWithXObjects(pdf, pageIdx);
+      metaRecords = resolvePageShowTextWithXObjects(pdf, pdfPageIdx);
     } catch {
       continue;
     }
+    console.log("[STRIP-B2] B-resolvePageShowTextWithXObjects done", { records: metaRecords.length });
     const metaById = new Map<string, TextShowRecord>();
     for (const r of metaRecords) metaById.set(r.operatorId, r);
-
-    // M7.8-042-FALLBACK-Y：页可视区顶部（CropBox.y1）—— pdfjs 视口 y（向下）↔ 原始用户空间
-    // textY（向上）换算锚点：textY ≈ y1 - pdfjsY。与 pdf.js getTextContent 的默认视口一致。
-    let cropTopY: number | undefined;
-    try {
-      const pge = pdf.getPage(pageIdx);
-      const cb = typeof pge.getCropBox === "function" ? pge.getCropBox() : undefined;
-      cropTopY = cb && cb.height > 0 ? cb.y + cb.height : pge.getHeight();
-    } catch {
-      cropTopY = undefined;
-    }
 
     // ①B 文本兜底（M7.8-041-FIX-STALE）：编辑行缺 operatorId provenance（旧 doc / HMR 残留内存态）
     // 时，按「行原文字」在流算子序列中文本匹配，回退到 provenance 剥离，使整行仍可被判定为
@@ -416,7 +480,10 @@ async function stripReplacedTextOperators(
         if (!isEdited) continue;
         const key = `${block.id}:${li}`;
         if ((lineOpIds.get(key)?.size ?? 0) > 0) continue; // 已有 provenance，无需兜底
-        const ids = textFallbackStripLine(line, metaRecords, cropTopY);
+        // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+        console.log("[STRIP-B2] C-textFallback start");
+        const ids = textFallbackStripLine(line, metaRecords);
+        console.log("[STRIP-B2] C-textFallback done", { ids: ids.length });
         if (ids.length > 0) {
           for (const id of ids) opIds.add(id);
           lineOpIds.set(key, new Set(ids));
@@ -456,6 +523,8 @@ async function stripReplacedTextOperators(
     // ③ 收集待剥离区间（按 stream 分组）；算子内任一 glyph 被编辑 → 整 operator 剥离
     //    同时保留 opId 与区间的关联，供「整行是否剥离干净」判定使用。
     //    注：此处仅用 metaById 取 streamRef；byteStart/byteEnd 在 ④ 中基于实际 cur 重算。
+    // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+    console.log("[STRIP-B2] D-targetsByStream start");
     const targetsByStream = new Map<string, { bs: number; be: number; opIds: string[] }[]>();
     for (const opId of opIds) {
       const rec = metaById.get(opId);
@@ -470,15 +539,22 @@ async function stripReplacedTextOperators(
       arr.push({ bs: rec.byteStart, be: rec.byteEnd, opIds: [opId] });
       targetsByStream.set(rec.streamObjRef, arr);
     }
+    // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+    console.log("[STRIP-B2] D-targetsByStream done", {
+      streams: targetsByStream.size,
+      opIds: opIds.size,
+    });
 
     // ④ 按 stream 回填（从后往前，带 delta 偏移，避免漂移）
     for (const [streamRef, targets] of targetsByStream) {
       // M7.8-040R-3 Bug A：streamObjRef==="embedded" 为内联页面内容流（直接流对象），
       // 不能走 ctx.pdf.stream("embedded")（非法间接引用），需直接拿流对象解析/回写。
+      // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+      console.log("[STRIP-B2] E-stream-read start", { streamRef });
       let original: string | null = null;
       let writeBack: ((text: string) => void) | null = null;
       if (streamRef === "embedded") {
-        const obj = getEmbeddedContentStream(pdf, pageIdx);
+        const obj = getEmbeddedContentStream(pdf, pdfPageIdx);
         if (!obj) continue;
         original = readStreamObject(obj);
         if (original == null) continue;
@@ -491,21 +567,40 @@ async function stripReplacedTextOperators(
         //   解析器判定页面内容流损坏 → 整页空白（用户报告「第一页内容无法显示」）。
         //   必须先 register 取 PDFRef，让 /Contents 指向间接对象。
         writeBack = (text: string) => {
+          // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+          console.log("[STRIP-B2] writeBack", { streamRef, n: ++writeBackCount, kind: "embedded" });
           const nb = new Uint8Array(text.length);
           for (let i = 0; i < text.length; i++) nb[i] = text.charCodeAt(i) & 0xff;
-          const pg = pdf.getPage(pageIdx) as any;
+          const pg = pdf.getPage(pdfPageIdx) as any;
           pg.node.set(
             PDFName.of("Contents"),
             pdf.context.register(pdf.context.stream(nb)),
           );
+          console.log("[STRIP-B2] writeBack-done", { streamRef, n: writeBackCount, kind: "embedded" });
         };
       } else {
         const refParts = streamRef.split(" ").map(Number);
         const ref = PDFRef.of(refParts[0], refParts[1] ?? 0);
         original = readStreamText(pdf, ref);
         if (original == null) continue;
-        writeBack = (text: string) => writeStreamText(pdf, ref, text);
+        writeBack = (text: string) => {
+          // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+          console.log("[STRIP-B2] writeBack", { streamRef, n: ++writeBackCount, kind: "ref" });
+          try {
+            writeStreamText(pdf, ref, text);
+          } finally {
+            console.log("[STRIP-B2] writeBack-done", { streamRef, n: writeBackCount, kind: "ref" });
+          }
+        };
       }
+      // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+      console.log("[STRIP-B2] E-stream-read done", { streamRef, originalLen: original?.length ?? -1 });
+      // [STRIP-B2] 临时诊断 marker —— 直接使用已存在的 original，不做额外计算
+      console.log("[STRIP-B2] stream-start", {
+        streamRef,
+        targets: targets.length,
+        originalLen: original.length,
+      });
       let cur = original;
 
       if (process.env.STRIP_DIAG === "1") {
@@ -712,6 +807,8 @@ async function stripReplacedTextOperators(
           for (const t of targets) for (const id of t.opIds) strippedOps.delete(id);
         }
       }
+      // [STRIP-B2] 临时诊断 marker（可移除；仅观察）
+      console.log("[STRIP-B2] stream-done", { streamRef });
     }
   }
 
@@ -771,26 +868,19 @@ async function stripReplacedTextOperators(
  *
  * @returns 该编辑行命中的原算子 operatorId 列表（可能跨多个 Tj/TJ）。
  */
-/**
- * M7.8-042-FALLBACK-Y · 文本兜底剥离 v2。
- *
- * v1 缺陷：把整页所有算子按流顺序拼成一条长文本，要求「行原文字」在其中**连续**命中。
- * 真实 PDF 的表格行文字在内容流中常与其它行交错（非连续）→ indexOf 失配（idx=-1）→
- * 整行不剥离 → 原文残留 + overlay 新文字叠加 = 重影（用户报告第 2 行 "power 100%"）。
- *
- * v2 优先走 **y 带过滤**：resolver 现为每个 showText 算子记录其文本行矩阵 baseline
- * （textY，原始用户空间），行 glyph 的 metrics.pdfTransform[5] 是 pdf.js 视口基线 y
- * （向下），两者满足 textY ≈ cropTopY - pdfjsY。先取「与编辑行同 baseline 带」的算子
- * 子集（彻底消除跨行同词误配），再做文本匹配；带内失配或无位置数据时退回 v1 全流匹配。
- *
- * @param cropTopY 页可视区顶部（CropBox.y + height），用于 pdfjs↔PDF 用户空间换算；缺省跳过 y 过滤。
- * @returns 该编辑行命中的原算子 operatorId 列表（可能跨多个 Tj/TJ）。
- */
-function textFallbackStripLine(
-  line: EditableLine,
-  metaRecords: TextShowRecord[],
-  cropTopY?: number,
-): string[] {
+function textFallbackStripLine(line: EditableLine, metaRecords: TextShowRecord[]): string[] {
+  const ops = metaRecords
+    .filter((r) => r.charCodes !== null && (r.unicodeText !== undefined || r.operatorText))
+    .sort((a, b) => a.byteStart - b.byteStart);
+  if (ops.length === 0) return [];
+  // 拼完整流文本（保留原样用于区间映射），同时记录每个算子的 [start, end)
+  let full = "";
+  const ranges: { id: string; start: number; end: number }[] = [];
+  for (const op of ops) {
+    const t = op.unicodeText ?? op.operatorText ?? "";
+    ranges.push({ id: op.operatorId, start: full.length, end: full.length + t.length });
+    full += t;
+  }
   const norm = (s: string) => s.replace(/\s+/g, "");
   // 重建「行原文字」：未编辑 glyph 直接用 char（即原文）；已编辑 glyph 用 originalChar
   // （插入字符的 originalChar 已为 undefined → 视为空，不污染匹配）；空格等布局字符照常。
@@ -800,95 +890,23 @@ function textFallbackStripLine(
       .join(""),
   );
   if (!target) return [];
-
-  const matchOps = (ops: TextShowRecord[], tag: string): string[] => {
-    // 拼完整流文本（保留原样用于区间映射），同时记录每个算子的 [start, end)
-    let full = "";
-    const ranges: { id: string; start: number; end: number }[] = [];
-    for (const op of ops) {
-      const t = op.unicodeText ?? op.operatorText ?? "";
-      ranges.push({ id: op.operatorId, start: full.length, end: full.length + t.length });
-      full += t;
+  const idx = norm(full).indexOf(target);
+  if (idx < 0) return [];
+  // 把归一化命中区间映射回原始 full 的 [lo, hi)
+  let lo = -1;
+  let hi = -1;
+  let acc = 0;
+  for (let i = 0; i < full.length; i++) {
+    if (/\s/.test(full[i])) continue;
+    if (lo < 0 && acc === idx) lo = i;
+    if (acc === idx + target.length - 1) {
+      hi = i + 1;
+      break;
     }
-    const idx = norm(full).indexOf(target);
-    if (process.env.MASK_DIAG === "1") {
-      console.error(`[FALLBACK-DBG:${tag}] line.id=${line.id} target=${JSON.stringify(target)} fullLen=${full.length} idx=${idx} firstFull=${JSON.stringify(norm(full).slice(0, 60))}`);
-    }
-    if (idx < 0) return [];
-    // 把归一化命中区间映射回原始 full 的 [lo, hi)
-    let lo = -1;
-    let hi = -1;
-    let acc = 0;
-    for (let i = 0; i < full.length; i++) {
-      if (/\s/.test(full[i])) continue;
-      if (lo < 0 && acc === idx) lo = i;
-      if (acc === idx + target.length - 1) {
-        hi = i + 1;
-        break;
-      }
-      acc++;
-    }
-    if (lo < 0 || hi < 0) return [];
-    const hit = ranges.filter((r) => r.end > lo && r.start < hi).map((r) => r.id);
-    if (process.env.MASK_DIAG === "1") {
-      console.error(`[FALLBACK-DBG:${tag}] line.id=${line.id} lo=${lo} hi=${hi} hitOps=${hit.length} full[lo..hi]=${JSON.stringify(full.slice(lo, hi))}`);
-    }
-    return hit;
-  };
-
-  const base = metaRecords
-    .filter((r) => r.charCodes !== null && (r.unicodeText !== undefined || r.operatorText))
-    .sort((a, b) => a.byteStart - b.byteStart);
-  if (base.length === 0) return [];
-
-  // ── 首选：y 带过滤匹配（同 baseline 才参与，跨行同词绝不误配）──
-  if (cropTopY !== undefined) {
-    const pdfjsYs = line.glyphs
-      .map((g) => (g as unknown as { metrics?: { pdfTransform?: number[] } }).metrics?.pdfTransform?.[5])
-      .filter((v): v is number => typeof v === "number" && Number.isFinite(v));
-    if (pdfjsYs.length > 0) {
-      const TOL = 2.5; // pt；行内 baseline 抖动容忍（远小于最小行距）
-      const min = Math.min(...pdfjsYs);
-      const max = Math.max(...pdfjsYs);
-      const fLo = cropTopY - max - TOL;
-      const fHi = cropTopY - min + TOL;
-      const bandOps = base.filter(
-        (r) => typeof r.textY === "number" && r.textY >= fLo && r.textY <= fHi,
-      );
-      if (bandOps.length > 0) {
-        const hit = matchOps(bandOps, "YBAND");
-        if (hit.length > 0) return hit;
-      }
-    }
+    acc++;
   }
-
-  // ── 退路：v1 全流匹配 ──
-  return matchOps(base, "FULL");
-}
-
-/**
- * CSS 显示坐标 → PDF pt 坐标（Y 翻转）
- *
- * @param cssRect CSS 显示坐标 { x, y, width, height }
- * @param ctx 导出上下文
- * @returns PDF pt 坐标 { x, y, width, height }
- */
-function cssToPdf(
-  cssRect: { x: number; y: number; width: number; height: number },
-  ctx: ExportContext
-): { x: number; y: number; width: number; height: number } {
-  const totalScale = ctx.renderScale * ctx.cssScale;
-  // M7.8-035-FIX-4：以页面顶部（MediaBox.y1）为翻转基准，与导入侧 pdfYToCssY 自洽。
-  const flipBase = ctx.pageTopPt ?? ctx.pageHeightPt;
-  // M7.8-048-FIX-EXPORT-X：glyph.bbox 是 renderScale 文档坐标系（CSS px @ scale=renderScale），
-  // cssScale 仅是「显示缩放」（clientWidth/canvas.width），不参与文档坐标换算。
-  // 此前 ptX 被多除了 cssScale → 编辑 overlay 文字相对原图右移 (约 cssScale 偏离量)。
-  // Y 仍由 baseline 单独处理、width/height 仅用于 mask bbox，故仅修正 X 一个维度。
-  const ptX = cssRect.x / ctx.renderScale;
-  const ptY = flipBase - (cssRect.y / totalScale) - (cssRect.height / totalScale);
-  const ptW = cssRect.width / totalScale;
-  const ptH = cssRect.height / totalScale;
-  return { x: ptX, y: ptY, width: ptW, height: ptH };
+  if (lo < 0 || hi < 0) return [];
+  return ranges.filter((r) => r.end > lo && r.start < hi).map((r) => r.id);
 }
 
 /**
@@ -911,6 +929,116 @@ function fontSizeCssToPt(fontSizeCss: number, ctx: ExportContext): number {
  *   - glyph：用 bbox（LayoutEngine 重新计算的位置）
  *   - style：同上
  */
+// ─────────────────────────────────────────────────────────────────────────────
+// ★ 2026-10-26 · 显示层 segflow 链式位移的**导出对等**（窄口径）
+//
+// 结构事实（本轮探针 __dyline 实证）：Core Layout 按 TextBox 固定锚布局 —— 编辑段
+// 折成 2 视觉行后，其第 2 行（Core y=857.02）**压进下一行（l26，Core 仍锚原位
+// 860.04）的行带**（重叠 81%）。显示层由 segFlowOverlays 链式位移承担；导出此前
+// 完全没有该机制 ⇒ 新增视觉行与下一行文字叠印、下一行被编辑后新旧文字错带分裂。
+//
+// 口径（与 PDFEditor segflow effect 同源，纯几何、无 padding 膨胀）：
+//   · overflow = 编辑 legacy 行的 Core 布局底部 − 原始行带底部（≥ 0.6×行高才算）；
+//   · 位移传播给**下方各行**（dy = overflow 起步），遇 dy ≤ 0.5 终止；
+//   · **窄口径**：只有「本来就会被重绘的编辑行」消费 dy —— 未编辑行由原内容流承担、
+//     其字形无法用原字体重绘（measured-only = Standard 14 会改字体），故链遇到
+//     未编辑行即停（其行带间隙吸收位移，与本场景一致）。
+// 缓存：按 pageBlocks 数组实例 WeakMap，保证同页各 block 计算一致且零重复开销。
+// ─────────────────────────────────────────────────────────────────────────────
+const pageDisplacementDyCache = new WeakMap<object, Map<EditableLine, number>>();
+
+function pageDisplacementDyOf(pageBlocks: EditableBlock[]): Map<EditableLine, number> {
+  const cached = pageDisplacementDyCache.get(pageBlocks);
+  if (cached) return cached;
+  const dyMap = new Map<EditableLine, number>();
+  try {
+    // ① 按 legacy lineId 聚合视觉行（Core 当前带 + 原始带）；同时保留视觉行对象引用
+    type Agg = {
+      id: string;
+      coreTop: number;
+      coreBottom: number;
+      origTop: number;
+      origBottom: number;
+      h: number;
+      edited: boolean;
+    };
+    const byId = new Map<string, Agg>();
+    const visualLinesById = new Map<string, EditableLine[]>();
+    for (const block of pageBlocks) {
+      if (block.type !== "text") continue;
+      for (const line of block.lines) {
+        const coreTop = Math.min(line.bbox?.y ?? Infinity, ...line.glyphs.map((g) => g.bbox?.y ?? Infinity));
+        const coreBottom = Math.max(
+          (line.bbox?.y ?? -Infinity) + (line.bbox?.height ?? 0),
+          ...line.glyphs.map((g) => (g.bbox?.y ?? -Infinity) + (g.bbox?.height ?? 0)),
+        );
+        if (!Number.isFinite(coreTop) || !Number.isFinite(coreBottom)) continue;
+        const h = coreBottom - coreTop;
+        if (!(h > 1)) continue;
+        const edited = line.edited === true || line.glyphs.some((g) => g.modified);
+        let origTop = coreTop;
+        let origBottom = coreBottom;
+        if (edited) {
+          const eob = line.editedOriginalBounds?.[0];
+          const obTops = line.glyphs.map((g) => g.originalBBox?.y).filter((v): v is number => typeof v === "number");
+          const obBottoms = line.glyphs
+            .map((g) => (g.originalBBox ? g.originalBBox.y + g.originalBBox.height : undefined))
+            .filter((v): v is number => typeof v === "number");
+          if (eob) {
+            origTop = eob.y;
+            origBottom = eob.y + eob.height;
+          } else if (obTops.length > 0) {
+            origTop = Math.min(...obTops);
+            origBottom = Math.max(...obBottoms);
+          }
+          // ⚠️ 刻意**不做**「新折出视觉行」的 orig 替换：聚合按 legacy 行取 min/max，
+          //   折出行携带的共享 eob（= legacy 原始带）正是聚合想要的原始带 ——
+          //   在视觉行粒度替换会让聚合 origBottom 被抬到 coreBottom ⇒ 溢出恒 0（实测回归）。
+          //   折出行自身不会被链位移（它属于 src.id，被 `s.id === src.id` 排除）。
+        }
+        const id = line.id ?? `__anon__${byId.size}`;
+        const prev = byId.get(id);
+        if (!prev) {
+          byId.set(id, { id, coreTop, coreBottom, origTop, origBottom, h, edited });
+          visualLinesById.set(id, [line]);
+        } else {
+          prev.coreTop = Math.min(prev.coreTop, coreTop);
+          prev.coreBottom = Math.max(prev.coreBottom, coreBottom);
+          prev.origTop = Math.min(prev.origTop, origTop);
+          prev.origBottom = Math.max(prev.origBottom, origBottom);
+          prev.h = Math.max(prev.h, h);
+          prev.edited = prev.edited || edited;
+          visualLinesById.get(id)!.push(line);
+        }
+      }
+    }
+    // ② 每个溢出的编辑行 → 链式位移其下方（仅编辑行消费；遇未编辑行终止）
+    const sorted = [...byId.values()].sort((a, b) => a.origTop - b.origTop);
+    for (const src of sorted) {
+      if (!src.edited) continue;
+      const overflow = src.coreBottom - src.origBottom;
+      if (!(overflow >= src.h * 0.6)) continue; // 无实质溢出 ⇒ 零波及（与显示层同判据）
+      let shift = overflow;
+      let prevNewBottom = src.coreBottom;
+      for (const s of sorted) {
+        if (s.id === src.id) continue;
+        if (s.origTop <= src.origTop + 1) continue; // 只看下方
+        if (!s.edited) break; // 窄口径：未编辑行不重绘 ⇒ 链终止（间隙吸收）
+        const newTop = Math.max(s.origTop + shift, prevNewBottom + 2);
+        const dy = newTop - s.origTop;
+        if (dy <= 0.5) break; // 与显示层同：位移被吸收 ⇒ 终止
+        for (const vl of visualLinesById.get(s.id) ?? []) dyMap.set(vl, Math.max(dyMap.get(vl) ?? 0, dy));
+        prevNewBottom = newTop + s.h;
+        shift = dy;
+      }
+    }
+  } catch {
+    /* 位移判定失败 ⇒ 无位移（fail-open 回退既有行为） */
+  }
+  pageDisplacementDyCache.set(pageBlocks, dyMap);
+  return dyMap;
+}
+
 export function renderBlockToExportCommands(
   block: EditableBlock,
   styles: EditableStyle[],
@@ -920,8 +1048,12 @@ export function renderBlockToExportCommands(
   editedLineBoxes?: Map<string, BBox>,
   /** M7.8-035R: 当前页所有 block，跨 block 找下一行顶。 */
   pageBlocks?: EditableBlock[],
+  /** ★ 2026-10-26 组键碰撞修复：本 block 实例的唯一组键前缀（`blockId#bi`）。 */
+  groupKeyBase?: string,
 ): ExportCommand[] {
   if (block.type !== "text") return [];
+  // ★ 临时 freshness 标记（导出专项）：确认浏览器执行的是本文件
+  console.log("[DYMARK-20261026]", String(block.id ?? "?").slice(-8));
 
   const commands: ExportCommand[] = [];
   const mode = block.layoutMode || "preserve";
@@ -950,22 +1082,117 @@ export function renderBlockToExportCommands(
     return { x0: p.x, y0: p.y, x1: p.x + p.width, y1: p.y + p.height };
   });
 
+  // ★ 2026-10-26：显示层 segflow 链式位移的导出对等（窄口径，见函数头注释）。
+  const dyByLine = pageBlocks ? pageDisplacementDyOf(pageBlocks) : null;
+
+
   // 逐行导出：仅非 native-ready / 未触碰的行需要 overlay（per-line mask + glyph 重绘）
   for (let li = 0; li < block.lines.length; li++) {
     const line = block.lines[li];
     const lineKey = nativeLineKey(block.id, li);
+    const lineEdited = line.glyphs.some((g) => g.modified) || line.edited === true;
+
+    // ── F3B-6.28 · D-3B-2：整行重绘（flow 成员行 + 被推移的位移行）─────────
+    //   唯一入口 = `line.redrawLines`（Binding 侧**只在** unit 编辑计划有效时挂载；
+    //   未挂载 ⇒ 本段整体不执行 ⇒ 产物与既有实现逐字节一致）。
+    //   ⚠️ 纪律：本段**不**参与既有写入资格判定（不改 `glyph.modified`、不放宽 raw-CID
+    //     检查、不触发 native replay），只追加独立的重绘命令。
+    //   ⚠️ 必须**先于** `skipOverlay`：`skipOverlay` 的语义是「原 PDF 内容流已承担该行
+    //     新文本」，而显式重绘几何意味着「内容流已被剥离、必须由我们重绘」—— 二者互斥，
+    //     不能让 skipOverlay 吃掉重绘（实测：单视觉行 block 的 lineKey 恒为
+    //     `blockId:0`，一旦该 key 被判 native-replaced，l6..l20 的重绘会被全部跳过）。
+    const redrawLines = (line as unknown as { redrawLines?: readonly LineRedrawGeometry[] | null })
+      .redrawLines;
+    const hasRedraw = !!redrawLines && redrawLines.length > 0;
+    // 该行属于「已被重绘覆盖的 Core 段落」（几何被同段落的另一条视觉行认领）
+    // ⇒ 文字已由 flow 重绘画出，绝不能再走既有 overlay（否则同一段文字画两遍）。
+    const redrawCovered =
+      !hasRedraw && (line as unknown as { redrawCovered?: boolean }).redrawCovered === true;
+    if (redrawCovered) continue;
+    if (hasRedraw) {
+      for (const r of redrawLines!) {
+        commands.push({
+          type: "drawRedrawLine",
+          pageIndex,
+          blockId: block.id,
+          lineIndex: li,
+          lineId: line.id,
+          role: r.role,
+          flowIndex: r.flowIndex ?? null,
+          text: r.text,
+          box: { x: r.box.x, y: r.box.y, width: r.box.width, height: r.box.height },
+          baselinePt: r.baselinePt,
+          originalBaselinePt: r.originalBaselinePt,
+          deltaCss: r.deltaCss,
+          glyphs: r.glyphs.map((g) => ({
+            char: g.char,
+            sourceLineId: g.sourceLineId,
+            sourceGlyphIndex: g.sourceGlyphIndex,
+            pdfCharCode: g.pdfCharCode,
+            fontRef: g.fontRef,
+            pdfTransform: g.pdfTransform ? [...g.pdfTransform] : null,
+            targetXPt: g.targetXPt,
+            targetBaselinePt: g.targetBaselinePt,
+            disposition: g.disposition,
+          })),
+        } as DrawRedrawLineCommand);
+      }
+      // 未编辑的位移行（l7..l20 等）只需重绘命令、**不需要** mask（原算子已由 drop 投影
+      // 剥离；画 mask 只会白白擦掉行内表格线）⇒ 直接跳到下一行。
+      if (!lineEdited) continue;
+    }
+
     const skipOverlay =
       routing.replacedLines.has(lineKey) || routing.fullyReplacedBlocks.has(block.id);
-    if (skipOverlay) continue;
+    if (skipOverlay && !hasRedraw) {
+      // ★ 2026-10-25（用户缺陷「修改后导出的 PDF 文本重复」）：native-replaced 行的
+      //   新文本由内容流 native replay 承担，但**剥离**依赖 glyph provenance
+      //   （operatorId）。再导出产物重导入 / OCR 文本层的 glyph 常无 operatorId
+      //   ⇒ drop 投影 `droppedOperatorIds` 为空 ⇒ 原算子无法定位剥离 ⇒ 原文残留
+      //   与 replay 新文本叠加 = 双层文本（实测复现 leak1024i：原两行 + 重绘两行）。
+      //   此时 drop 投影的 `editedOriginalBounds`（原文真实区域，来自 Sidecar
+      //   sourceBBoxes）仍然可用 ⇒ 强制区域遮盖：白块盖住原文本带（replay 新文本
+      //   在流中先行绘制，本命令追加在后 ⇒ 只盖原文不盖新文本）。
+      //   门控（极窄）：仅 `droppedOperatorIds` **为空**（剥离不可能）且
+      //   `editedOriginalBounds` 非空（原文区域已知）的行；有算子的行走既有剥离，
+      //   纯插入行（无 source glyph）无 bounds ⇒ 不触发 ⇒ 正常文档零波及。
+      const residualOps = (line as unknown as { droppedOperatorIds?: readonly string[] }).droppedOperatorIds;
+      const residualBounds = (line as unknown as { editedOriginalBounds?: readonly BBox[] }).editedOriginalBounds;
+      if (
+        residualOps !== undefined &&
+        residualOps.length === 0 &&
+        residualBounds !== undefined &&
+        residualBounds.length > 0
+      ) {
+        for (const ob of residualBounds) {
+          const pdfRect = cssToPdf(
+            {
+              x: ob.x - MASK_PADDING_X,
+              y: ob.y - MASK_PADDING_Y,
+              width: ob.width + MASK_PADDING_X * 2,
+              height: ob.height + MASK_PADDING_Y * 2,
+            },
+            ctx,
+          );
+          commands.push({
+            type: "drawLine",
+            pageIndex,
+            x: pdfRect.x,
+            y: pdfRect.y,
+            width: pdfRect.width,
+            height: pdfRect.height,
+            purpose: "mask",
+            blockId: block.id,
+            lineIndex: li,
+          } as DrawLineCommand);
+        }
+      }
+      continue;
+    }
 
-    // ── M7.8-034 Phase B: 只为「真正被编辑的行」生成 mask + 重绘 ──
-    // 旧行为：block 内所有行都生成白色 mask + 逐 glyph 重绘。结果是整块原文被擦掉后
-    // 用（回落后的）Standard 14 字体重画 —— 即使那些行一个字都没改。
-    // 这正是用户报告的「导出后字体/大小/样式/长度全变」以及「邻行被遮」的直接原因。
-    // 新行为：未编辑的行完全不碰，由原 PDF 内容流原样呈现（像素级零损伤）。
-    // M7.8-040R-3 Bug B：编辑可能是「删除 / 无变化」（残留 glyph 未被标 modified），
-    // 但 line.edited 已由 applySegmentEditsToDocument 置 true → 仍判定为已编辑，整行 overlay 重绘。
-    const lineEdited = line.glyphs.some((g) => g.modified) || line.edited === true;
+    // M7.8-034 Phase B：只为「真正被编辑的行」生成 mask + 既有 overlay 重绘。
+    // 未编辑的行完全不碰，由原 PDF 内容流原样呈现（像素级零损伤）。
+    //（`lineEdited` 已在循环开头计算 —— 重绘分支先于此处使用。）
     if (!lineEdited) continue;
 
     // M7.7-006: per-line mask —— 优先用编辑态记录的真实墨迹覆盖盒（editedLineBoxes，含 canvas 扫描
@@ -1049,6 +1276,31 @@ export function renderBlockToExportCommands(
     // 先按「行级 bbox」计算垂直范围（含 nextTop 钳制），再按 glyph 切分为多个小 mask。
     // 这样 glyph 之间的表格线/竖线不会被整行白矩擦除（用户报告表格线消失）。
     let maskRects: { x: number; y: number; width: number; height: number }[] = [];
+    // [TEMP-H1H2] l6 ink 判据诊断（只读）
+    try {
+      const lidH = line.id ?? "(no-id)";
+      if (String(block.id ?? "").includes("block0")) {
+        let bboxPresent = 0, bboxZero = 0, bboxNonFinite = 0;
+        for (const g of line.glyphs) {
+          const bb = g.originalBBox ?? g.bbox;
+          if (!bb) continue;
+          bboxPresent += 1;
+          if (!(bb.width > 0) || !(bb.height > 0)) bboxZero += 1;
+          if (!Number.isFinite(bb.x + bb.y + bb.width + bb.height)) bboxNonFinite += 1;
+        }
+        (window as any).__h12 ??= [];
+        (window as any).__h12.push({
+          lineId: lidH, glyphCount: line.glyphs.length,
+          bboxPresent, bboxZero, bboxNonFinite,
+          inkMinX: Number.isFinite(inkMinX) ? Math.round(inkMinX * 100) / 100 : null,
+          inkMaxX: Number.isFinite(inkMaxX) ? Math.round(inkMaxX * 100) / 100 : null,
+          inkMinY: Number.isFinite(inkMinY) ? Math.round(inkMinY * 100) / 100 : null,
+          inkMaxY: Number.isFinite(inkMaxY) ? Math.round(inkMaxY * 100) / 100 : null,
+          inkBranch: inkMaxX > inkMinX && inkMaxY > inkMinY,
+          hasRealBox: Boolean(realBox),
+        });
+      }
+    } catch { /* ignore */ }
     if (inkMaxX > inkMinX && inkMaxY > inkMinY) {
       // 加安全 padding 覆盖抗锯齿半透明像素，同时避免侵入相邻行（上下均需防护）。
       let mh = inkMaxY - inkMinY + MASK_PADDING_Y * 2;
@@ -1131,6 +1383,34 @@ export function renderBlockToExportCommands(
         if (estTop < inkTop) inkTop = estTop;
       }
       let my = inkTop - MASK_PADDING_Y;
+      // ══ P0-2：multi-visual-line detection → bypass legacy line-level clamp ════
+      //
+      // ★ 结构性矛盾判据（无 magic threshold）：
+      //   `nextTop` 定义为「本行墨迹【之下】的最近一行顶」，单视觉行时必然 ≥ inkMaxY；
+      //   `prevBottom` 对称。若落入本行 ink 内部 ⇒ 唯一解释 = 本 legacy line 实际
+      //   包含多个 visual rows（编辑 reflow / reload 拓扑改变）⇒ 行级钳制把 mask
+      //   推到错误位置（实测：ink [364,431]，mask 被推到 [428,496] ⇒ 原文 100% 漏盖）。
+      //
+      // ★ fail-safe：让两个钳制输入失效（undefined）⇒ 走**既有路径**，
+      //   mask 窗口自然退化为完整 ink union（inkTop/inkBottom + padding）。
+      //   普通单视觉行 PDF 逐字节走旧路径（判据不触发）。
+      const nextTopInside = nextTop !== undefined && nextTop > inkMinY + 0.001 && nextTop < inkMaxY - 0.001;
+      const prevBottomInside = prevBottom !== undefined && prevBottom > inkMinY + 0.001 && prevBottom < inkMaxY - 0.001;
+      if (nextTopInside || prevBottomInside) {
+        if (process.env.MASK_DIAG === "1") {
+          console.log(
+            `[MASK_DIAG][P02-UNION] line=${line.id} inkMinY=${inkMinY.toFixed(2)} inkMaxY=${inkMaxY.toFixed(2)} ` +
+            `nextTopInside=${nextTopInside} prevBottomInside=${prevBottomInside}`
+          );
+        }
+        nextTop = undefined;
+        prevBottom = undefined;
+        // baseline 估算同样不可信（跨视觉行 ⇒ baseline 属于某一个 visual row），
+        // 强制用真实 ink union：直接还原 inkTop/inkBottom 到墨迹极值。
+        inkTop = inkMinY;
+        inkBottom = inkMaxY;
+        my = inkTop - MASK_PADDING_Y;
+      }
       // ⑤ 上沿钳制：绝不越过上一行墨迹底部（留 1px 安全间隙）。
       //    宁可当前行顶部残留一点，也绝不能擦掉上一行的有效内容（后者是数据丢失）。
       if (prevBottom !== undefined && my < prevBottom + 1) my = prevBottom + 1;
@@ -1171,7 +1451,36 @@ export function renderBlockToExportCommands(
 
       // 逐 glyph 生成 mask：覆盖原位置 ∪ 编辑后位置，但跳过表格布局用的超宽空格。
       // 多个小 mask 之间会保留表格线（竖线 / 部分横线）。
-      const rawRects: { x: number; y: number; width: number; height: number }[] = [];
+      const rawRects: { x: number; y: number; width: number; height: number; src?: string }[] = [];
+      // [TEMP-Db] D-b：li=0/1 glyph geometry 存在率 + 真实 guard 命中统计（只读）
+      try {
+        const lid = line.id ?? "";
+        if (String(lid).includes("block0_l")) {
+          const stats = { glyphCount: line.glyphs.length, bboxPresent: 0, originalBBoxPresent: 0, baselinePresent: 0, guard_noB1B2: 0, guard_nonFinite: 0, guard_rbLeRy: 0, guard_wideSpace: 0, passed: 0, missingSample: [] as any[] };
+          line.glyphs.forEach((g: any, gi: number) => {
+            if (g.bbox) stats.bboxPresent += 1;
+            if (g.originalBBox) stats.originalBBoxPresent += 1;
+            if (typeof g.baseline === "number" && Number.isFinite(g.baseline)) stats.baselinePresent += 1;
+            const bw = g.bbox?.width ?? 0;
+            const isWideSpace = (g.char === " " || g.originalChar === " ") && bw > maxNormalWidth;
+            const b1 = g.originalBBox ?? g.bbox;
+            const b2 = g.bbox;
+            if (!b1 && !b2) { stats.guard_noB1B2 += 1; if (stats.missingSample.length < 3) stats.missingSample.push({ gi, char: g.char, bbox: g.bbox ?? null, originalBBox: g.originalBBox ?? null, baseline: g.baseline ?? null }); return; }
+            const minX = Math.min(b1?.x ?? Infinity, b2?.x ?? Infinity);
+            const minY = Math.min(b1?.y ?? Infinity, b2?.y ?? Infinity);
+            const maxX = Math.max(b1 ? b1.x + b1.width : -Infinity, b2 ? b2.x + b2.width : -Infinity);
+            const maxY = Math.max(b1 ? b1.y + b1.height : -Infinity, b2 ? b2.y + b2.height : -Infinity);
+            if (!Number.isFinite(minX + minY + maxX + maxY)) { stats.guard_nonFinite += 1; return; }
+            const ryD = Math.max(lineMaskTop, minY - MASK_PADDING_Y);
+            const rbD = Math.min(lineMaskBottom, maxY + MASK_PADDING_Y);
+            if (rbD <= ryD) { stats.guard_rbLeRy += 1; if (stats.guard_rbLeRy <= 2) stats.missingSample.push({ gi, char: g.char, minY: Math.round(minY * 100) / 100, maxY: Math.round(maxY * 100) / 100, reason: "rbLeRy" }); return; }
+            if (isWideSpace) { stats.guard_wideSpace += 1; return; }
+            stats.passed += 1;
+          });
+          (window as any).__db ??= [];
+          (window as any).__db.push({ lineId: lid, li, ...stats, lineMaskTop: Math.round(lineMaskTop * 100) / 100, lineMaskBottom: Math.round(lineMaskBottom * 100) / 100 });
+        }
+      } catch { /* ignore */ }
       for (const g of line.glyphs) {
         const bw = g.bbox?.width ?? 0;
         // 跳过表格布局用的超宽空格（本身不含可见墨迹，mask 会误擦列间表格线）。
@@ -1200,7 +1509,17 @@ export function renderBlockToExportCommands(
         const ry = Math.max(lineMaskTop, minY - MASK_PADDING_Y);
         const rb = Math.min(lineMaskBottom, maxY + MASK_PADDING_Y);
         if (rb <= ry) continue;
-        rawRects.push({ x: rx, y: ry, width: maxX - minX + MASK_PADDING_X * 2, height: rb - ry });
+        rawRects.push({ x: rx, y: ry, width: maxX - minX + MASK_PADDING_X * 2, height: rb - ry, src: "glyph" });
+        // [TEMP-P02] per-rect 来源取证（只读）
+        try {
+          (window as any).__p02rects ??= [];
+          (window as any).__p02rects.push({
+            lineId: line.id ?? "?", src: "glyph", char: g.char, orig: g.originalChar ?? null,
+            b1: b1 ? { x: Math.round(b1.x * 100) / 100, y: Math.round(b1.y * 100) / 100, w: Math.round(b1.width * 100) / 100, h: Math.round(b1.height * 100) / 100 } : null,
+            b2: b2 ? { x: Math.round(b2.x * 100) / 100, y: Math.round(b2.y * 100) / 100, w: Math.round(b2.width * 100) / 100, h: Math.round(b2.height * 100) / 100 } : null,
+            rect: { x: Math.round(rx * 100) / 100, y: Math.round(ry * 100) / 100, w: Math.round((maxX - minX + MASK_PADDING_X * 2) * 100) / 100, h: Math.round((rb - ry) * 100) / 100 },
+          });
+        } catch { /* ignore */ }
       }
 
       // M7.8-FIX：兜底覆盖「被替换子串的原始位置」。当一行被编辑、但原 PDF 文本算子既无法
@@ -1211,19 +1530,56 @@ export function renderBlockToExportCommands(
       // 竖线），垂直被 lineMaskTop/Bottom 钳制（不会擦掉上下表格线）。
       if ((line.glyphs.some((g) => g.modified) || line.edited) && line.editedOriginalBounds?.length) {
         for (const ob of line.editedOriginalBounds) {
+          // ★★ E-d-1（P0-2）：editedOriginalBounds = 原始 PDF 文字真实位置（覆盖责任的第一手事实），
+          //   **不受 reflow 后 lineMaskTop/Bottom 垂直裁剪**。
+          //   实测（E-c）：reload 重排后 para 行窗口 [382.61,410.07] 把原文 bbox (y364.15,h21.46)
+          //   裁成 6px(4.5pt) 残片 ⇒ 原文 y364–382 段漏盖 ⇒ anchor×2。
+          //   邻行保护语义只适用于 per-glyph 流水段（上方分支）；eob 是原文覆盖责任，完整保留。
           const rx = ob.x - MASK_PADDING_X;
-          const ry = Math.max(lineMaskTop, ob.y - MASK_PADDING_Y);
-          const rb = Math.min(lineMaskBottom, ob.y + ob.height + MASK_PADDING_Y);
+          const ry = ob.y - MASK_PADDING_Y;
+          const rb = ob.y + ob.height + MASK_PADDING_Y;
           if (rb > ry) {
-            rawRects.push({ x: rx, y: ry, width: ob.width + MASK_PADDING_X * 2, height: rb - ry });
+            rawRects.push({ x: rx, y: ry, width: ob.width + MASK_PADDING_X * 2, height: rb - ry, src: "eob" });
           }
+          // [TEMP-Ec] eob 分支取证（只读）：preClamp/postClamp 全量
+          try {
+            (window as any).__p02eob ??= [];
+            (window as any).__p02eob.push({
+              lineId: line.id ?? "?", lineIndex: li,
+              sourceBBox: { x: Math.round(ob.x * 100) / 100, y: Math.round(ob.y * 100) / 100, w: Math.round(ob.width * 100) / 100, h: Math.round(ob.height * 100) / 100 },
+              preClamp: { y: Math.round((ob.y - MASK_PADDING_Y) * 100) / 100, h: Math.round((ob.height + MASK_PADDING_Y * 2) * 100) / 100 },
+              maskTop: Math.round(lineMaskTop * 100) / 100, maskBottom: Math.round(lineMaskBottom * 100) / 100,
+              postClamp: { y: Math.round(ry * 100) / 100, h: Math.round((rb - ry) * 100) / 100 },
+              clamped: ob.y - MASK_PADDING_Y < lineMaskTop || ob.y + ob.height + MASK_PADDING_Y > lineMaskBottom,
+            });
+          } catch { /* ignore */ }
         }
       }
 
       // 合并水平相邻/重叠的 mask，减少 PDF 小矩形数量。
       rawRects.sort((a, b) => a.x - b.x);
+      // [TEMP-P02] 行级钳制参数取证（只读）：解释 h=1.5 细条
+      try {
+        (window as any).__p02line ??= [];
+        (window as any).__p02line.push({
+          lineId: line.id ?? "?", glyphN: line.glyphs.length,
+          inkMinY: Math.round(inkMinY * 100) / 100, inkMaxY: Math.round(inkMaxY * 100) / 100,
+          maxBaseline: Number.isFinite(maxBaseline) ? Math.round(maxBaseline * 100) / 100 : null,
+          inkTop: Math.round(inkTop * 100) / 100, inkBottom: Math.round(inkBottom * 100) / 100,
+          prevBottom: prevBottom !== undefined ? Math.round(prevBottom * 100) / 100 : null,
+          nextTop: nextTop !== undefined ? Math.round(nextTop * 100) / 100 : null,
+          maskTop: Math.round(lineMaskTop * 100) / 100, maskBottom: Math.round(lineMaskBottom * 100) / 100,
+          mh: Math.round(mh * 100) / 100,
+          editedOriginalBoundsN: line.editedOriginalBounds?.length ?? 0,
+          // ★ E-b-0：editedOriginalBounds 内容（原文真实位置 vs mask 窗口对照）
+          editedOriginalBounds: (line.editedOriginalBounds ?? []).map((ob: any) => ({
+            x: Math.round(ob.x * 100) / 100, y: Math.round(ob.y * 100) / 100,
+            w: Math.round(ob.width * 100) / 100, h: Math.round(ob.height * 100) / 100,
+          })),
+        });
+      } catch { /* ignore */ }
       for (const r of rawRects) {
-        const last = maskRects[maskRects.length - 1];
+        const last = maskRects[maskRects.length - 1] as any;
         if (
           last &&
           r.x <= last.x + last.width + 2 && // 水平间距 ≤ 2px 视为连续文本
@@ -1238,8 +1594,10 @@ export function renderBlockToExportCommands(
           last.y = newY;
           last.width = newR - newX;
           last.height = newB - newY;
+          // [TEMP-Ed2] 观测：合并后 src 归属（不改合并行为）
+          if (last.src !== r.src) last.src = "mixed";
         } else {
-          maskRects.push({ ...r });
+          maskRects.push({ ...r } as any);
         }
       }
     } else if (realBox) {
@@ -1281,6 +1639,25 @@ export function renderBlockToExportCommands(
 
     for (const rect of maskRects) {
       const pdfRect = cssToPdf(rect, ctx);
+      // [TEMP-Ed2] console 直打（与 C2 同机制，绕开 window 传输）
+      if (typeof console !== "undefined") {
+        console.log("[ED2CMD]", JSON.stringify({
+          lineId: line.id ?? "?", lineIndex: li, src: (rect as any).src ?? "unknown",
+          cssW: Math.round(rect.width * 100) / 100, cssH: Math.round(rect.height * 100) / 100,
+        }));
+      }
+      // [TEMP-P02b] 最终 mask command 来源取证（只读）：rect → line → 阶段
+      try {
+        (window as any).__p02cmd ??= [];
+        (window as any).__p02cmd.push({
+          blockId: block.id, lineIndex: li, lineId: line.id ?? "?",
+          src: (rect as any).src ?? "unknown",
+          nMaskRects: maskRects.length,
+          mode: (nextTop === undefined && prevBottom === undefined) ? "P02-UNION" : "legacy",
+          css: { x: Math.round(rect.x * 100) / 100, y: Math.round(rect.y * 100) / 100, w: Math.round(rect.width * 100) / 100, h: Math.round(rect.height * 100) / 100 },
+          pdf: { x: Math.round(pdfRect.x * 100) / 100, y: Math.round(pdfRect.y * 100) / 100, w: Math.round(pdfRect.width * 100) / 100, h: Math.round(pdfRect.height * 100) / 100 },
+        });
+      } catch { /* ignore */ }
       commands.push({
         type: "drawLine",
         pageIndex,
@@ -1315,14 +1692,58 @@ export function renderBlockToExportCommands(
     }
     // M7.8-034 Phase C: 重绘集合 = 整行，与 mask 范围严格一致（避免前缀叠画重影）。
     // Phase C 会接管：以行首 pdfTransform 为基准、原字体 + raw CID + native advance 重建。
+    // RAW-FALLBACK-01 · 修正 2 A-direct（受控分支，默认关）：预扫同行 raw glyph 的
+    // `baseline` 字段（adapter L311 = pdfYToCssY(pdfY) 第一手 CSS 基线，零公式复用）。
+    // 参考失效（无 raw glyph/重排）⇒ undefined ⇒ fail-closed 回退修正 1 兜底。
+    let directRawCssBaseline: number | undefined;
+    if (isRawFallbackDirectBaselineEnabled()) {
+      const rawGlyph = line.glyphs.find((g: any) => Number.isFinite(g?.baseline));
+      if (rawGlyph) directRawCssBaseline = rawGlyph.baseline;
+    }
+    // F3B-6.28 · D-3B-2：本行文字已由上面 push 的 `drawRedrawLine` 命令承担
+    //   ⇒ 跳过既有逐 glyph overlay 与邻行重绘块（否则同一行被画两遍）。
+    if (hasRedraw) continue;
     for (const glyph of line.glyphs) {
-      // PRESERVE 模式用 originalBBox，RECONSTRUCT 用 bbox
-      const bbox =
-        mode === "preserve" && glyph.originalBBox
-          ? glyph.originalBBox
-          : glyph.bbox;
+      // ★ 2026-10-25（用户缺陷「修改后导出的 PDF 文本重复」）：
+      //   PRESERVE 模式原本优先 `originalBBox`（原 PDF 第一手位置）。对**未重排**的编辑
+      //   行（原位=新位）二者一致；但段落被 Core 重排（折行点移动）后，后续视觉行的
+      //   原字符 `originalBBox` 仍指向**原文旧视觉行**的位置（Sidecar sourceBBox 是
+      //   import 期原文几何）——用它定位重绘会把整行新文本画回旧行带 ⇒ 与前一视觉行
+      //   叠印（实测 leak1024i：行 1 "afastamento doX" 画在行 0 带 x=565.55 上）。
+      //   判据（确定性、非启发式）：originalBBox 的垂直带与**本行当前行带**的重叠
+      //   ≥ 自身高度的一半 ⇒ 原位在本行带内（原位=新位），沿用 originalBBox（保住
+      //   未重排行的像素级原位，历史验收零波及）；重叠不足 ⇒ 该字符的原文位于其它
+      //   视觉行（重排把后续内容挤到了新行）⇒ 用当前布局 glyph.bbox（Core Layout）。
+      //   （贴边不算重叠：相邻行共享 y 边界，实测 leak1024i 行 1 的 originalBBox 底边
+      //   恰好等于行 1 顶边 ⇒ 必须用重叠量而非区间包含。）
+      //   原文区域的覆盖职责由 mask/editedOriginalBounds 承担（mask 管线不受影响）。
+      //   （能走到这里的行都是编辑行——上方 `if (!lineEdited) continue`。）
+      const ob = mode === "preserve" ? glyph.originalBBox : undefined;
+      const obOverlap =
+        ob && line.bbox
+          ? Math.min(ob.y + ob.height, line.bbox.y + line.bbox.height) -
+            Math.max(ob.y, line.bbox.y)
+          : 0;
+      const obInCurrentBand = !!ob && obOverlap >= ob.height * 0.5;
+      const bbox = ob && obInCurrentBand ? ob : glyph.bbox;
+      // ★ 2026-10-26：链式位移（窄口径）。dyLine > 0 ⇒ 本行被显示层 segflow 判定位移，
+      //   导出必须同样下移，否则与上方溢出的新视觉行叠印（实测 dezembro 行分裂）。
+      //   只平移 y：pdfRect 用**位移后 bbox**；基线相对式保持用**原 bbox**（baseCssY
+      //   与 bbox.bottom 同源相对差不变）⇒ 基线自动随 pdfRect 下移，零双重换算。
+      //   raw Tm（native replay / raw-CID 直发的第一手矩阵）同步平移 f 分量。
+      const dyLine = dyByLine?.get(line) ?? 0;
+      const bboxEff = dyLine > 0 ? { ...bbox, y: bbox.y + dyLine } : bbox;
 
-      const pdfRect = cssToPdf(bbox, ctx);
+      // ★ 同缺陷：X 契约。glyph.bbox（Core Layout）与 originalBBox（Sidecar sourceBBox）
+      //   均为导入侧 CoordinateMapper 产物（×totalScale 空间，与 cssToPdf 的
+      //   y/width/height 同口径）；cssToPdf 的 X 分量历史上走 ÷renderScale 特例
+      //   （M7.8-048，cssScale===1 时两契约等价）。cssScale≠1 的文档（实测本例
+      //   cssScale=0.2995）x 被缩小 cssScale 倍（22.17pt vs 正确 74.0pt）⇒ glyph 绘制
+      //   改用 document-space 契约（cssToPdfXDocumentSpace），cssScale=1 时逐位不变。
+      const pdfRect = {
+        ...cssToPdf(bboxEff, ctx),
+        x: cssToPdfXDocumentSpace(bbox.x, ctx),
+      };
       const glyphStyle = styles[glyph.styleRef] || lineStyle;
       const fontSizePt = fontSizeCssToPt(
         glyphStyle.fontSize || 14,
@@ -1335,10 +1756,20 @@ export function renderBlockToExportCommands(
       // 公式与 cssToPdf 同源：baselinePdfY = flipBase - baseCssY/totalScale，
       // 用 pdfRect.y 反推以保证与 bbox 转换自洽（含 MediaBox.y0、scale 等）。
       const totalScale = ctx.renderScale * ctx.cssScale;
-      const baseCssY =
-        typeof glyph.baseline === "number" && Number.isFinite(glyph.baseline)
-          ? glyph.baseline
-          : bbox.y + bbox.height; // 兜底：bbox 底部近似 baseline
+      // RAW-FALLBACK-01 · 修正 1（方案 i′，受控分支，默认关）：bridge glyph 无 baseline
+      // 字段 ⇒ 旧兜底用 bbox 底部（bbox-top 语义）⇒ fallback 绘制与 raw 直发（pdfY 第一手）
+      // 产生实测 4.47pt 差（a05 同逻辑基线样本，SPEC R5-B）。flag 开启时兜底改用行级
+      // baseline（bridge L862 直通 layout CSS baseline；R3 已证同行混排共享基线）。
+      // 优先级：glyph.baseline → (flag) line.baseline → bbox 底部（flag 关 = 现状逐位不变）。
+      // 三层逻辑提取为 resolveBaseCssY（与专项测试共用，见 export-fallback-baseline-align.ts）。
+      const baseCssY = resolveBaseCssY({
+        glyphBaseline: glyph.baseline,
+        lineBaseline: line.baseline,
+        fallbackBaselineAlignEnabled: isFallbackBaselineAlignEnabled(),
+        bboxBottom: bbox.y + bbox.height,
+        directRawCssBaseline,
+        rawFallbackDirectBaselineEnabled: isRawFallbackDirectBaselineEnabled(),
+      });
       const baselinePdfY = pdfRect.y + (bbox.y + bbox.height - baseCssY) / totalScale;
 
       // ── M7.8-036 / BUG-COORD-Y-ROOT-001 只读诊断（临时，判 A/B 用，不改变任何业务逻辑）──
@@ -1349,11 +1780,27 @@ export function renderBlockToExportCommands(
           pdfTransform5: glyph.metrics?.pdfTransform?.[5],
           baseline: glyph.baseline,
           bboxY: glyph.bbox.y,
-          bboxHeight: glyph.bbox.height,
+          bboxHeight: bbox.height,
           pdfY: (glyph as any).pdfY,
           commandBaseline: baselinePdfY,
         });
       }
+      // [TEMP-DY] 逐字符绘制来源取证（只读）：ob（原文）vs glyph.bbox（Core 当前）
+      try {
+        (window as any).__dydiag ??= [];
+        (window as any).__dydiag.push({
+          lineId: line.id ?? "?", lineIndex: li,
+          char: glyph.char,
+          modified: !!glyph.modified,
+          hasOb: !!ob,
+          obY: ob ? Math.round(ob.y * 100) / 100 : null,
+          curY: glyph.bbox ? Math.round(glyph.bbox.y * 100) / 100 : null,
+          lineY: line.bbox ? Math.round(line.bbox.y * 100) / 100 : null,
+          inBand: obInCurrentBand,
+          useOb: bbox === ob,
+          outY: Math.round(baselinePdfY * 100) / 100,
+        });
+      } catch { /* ignore */ }
 
       commands.push({
         type: "drawTextGlyph",
@@ -1382,24 +1829,58 @@ export function renderBlockToExportCommands(
         // M7.8-035-FIX：优先读 glyph 顶层的 fontIdentity / pdfCharCode（导入时由
         // 原 PDF object graph 直接写入），metrics 作为兼容回退。
         fontIdentity: glyph.fontIdentity ?? glyph.metrics?.fontIdentity,
+        // ★ Step 5B：**行级** export provenance（原字体身份）。
+        //   ⚠️ 刻意与上面的 `fontIdentity` 分开：本字段只喂 CID/非 WinAnsi 重绘，
+        //   绝不能参与 `isMeasuredOnly` 判定（否则会把普通 WinAnsi 行踢出
+        //   M7.8-0XX 的整行单次 drawText，重新打开字距问题）。
+        originalFontIdentity: line.originalFontIdentity,
         pdfCharCode: glyph.pdfCharCode ?? glyph.metrics?.pdfCharCode,
-        pdfTransform: glyph.metrics?.pdfTransform,
-        glyphMetrics: glyph.metrics,
+        // ★ P0-1：顶层 pdfTransform（bridge raw provenance 注入）与 metrics 同权。
+        //   链式位移 ⇒ raw Tm 的 f 分量同步下移（native replay / raw-CID 直发落点一致）。
+        pdfTransform: (() => {
+          const rawTm = glyph.pdfTransform ?? glyph.metrics?.pdfTransform;
+          if (!(dyLine > 0) || !Array.isArray(rawTm) || rawTm.length < 6) return rawTm;
+          return [...rawTm.slice(0, 5), (rawTm[5] as number) - dyLine / totalScale] as typeof rawTm;
+        })(),
+        glyphMetrics: (() => {
+          if (!(dyLine > 0) || !glyph.metrics) return glyph.metrics;
+          const mt = glyph.metrics.pdfTransform;
+          return Array.isArray(mt) && mt.length >= 6
+            ? { ...glyph.metrics, pdfTransform: [...mt.slice(0, 5), (mt[5] as number) - dyLine / totalScale] as typeof mt }
+            : glyph.metrics;
+        })(),
+        // ★ 2026-10-26 组键碰撞修复：写阶段按本键分组（block 实例唯一），杜绝
+        //   同 legacy blockId 的不同 block 因 lineIndex 归零而并组。
+        groupKey: groupKeyBase ? `${groupKeyBase}:${li}` : undefined,
       } as DrawTextGlyphCommand);
     }
     // ── M7.8-024 Step B: 编辑行 mask 若与邻行墨迹真实重叠，用原嵌入字体重绘受影响邻行 ──
     // 不写死 N+1：以 analyzeMaskImpact 的几何相交结果为准（spec §4.1）。
+    //
+    // ── 4B-4H-FIX（L1）：重绘**只针对**「本身不会被 per-glyph 重绘」的邻行 ──
+    //   背景（export command provenance forensic，Case 2 实测）：
+    //     编辑使一行折成两行后，两行互为邻行且**都走 per-glyph overlay**；
+    //     本段把对方 glyph 再 push 一遍 ⇒ 每 glyph 恰好 ×2
+    //     （实测 48→96、24→48；「长」40→80；commands 144 = 72×2）。
+    //   语义：本段的存在理由是「native 承载的邻行被 mask 盖住、又没人重绘它」
+    //     ⇒ 只有 `routing.replacedLines`（skip-overlay，原 PDF 承载）的邻行才需要重绘；
+    //       走 per-glyph overlay 的邻行**本来就会**在本循环内被重绘，再发一遍是纯重复。
+    //   ⚠️ 不改 native 邻行的重绘行为（那是本段的原用途）。
     {
       const impact = analyzeMaskImpact(bands, li);
       for (const aj of impact.affectedLineIndices) {
         if (aj === li) continue;
+        // ★ L1 修复：邻行本身走 per-glyph overlay（非 skip-overlay）⇒ 会被正常重绘，跳过
+        if (!routing.replacedLines.has(nativeLineKey(block.id, aj))) continue;
         const nLine = block.lines[aj];
         if (!nLine || nLine.glyphs.length === 0) continue;
         const nStyleRef = nLine.glyphs[0].styleRef ?? 0;
         const nStyle = styles[nStyleRef] || lineStyle;
         for (const glyph of nLine.glyphs) {
           const nb = mode === "preserve" && glyph.originalBBox ? glyph.originalBBox : glyph.bbox;
-          const npdf = cssToPdf(nb, ctx);
+          // 邻行若被判链式位移 ⇒ 重绘落点同步下移（与自身行 glyph 循环同口径）
+          const nDy = dyByLine?.get(nLine) ?? 0;
+          const npdf = cssToPdf(nDy > 0 ? { ...nb, y: nb.y + nDy } : nb, ctx);
           commands.push({
             type: "drawTextGlyph",
             pageIndex,
@@ -1671,14 +2152,52 @@ export function renderDocumentToExportCommands(
 
   for (let pi = 0; pi < doc.pages.length; pi++) {
     const page = doc.pages[pi];
+    // ★ 2026-10-22（用户缺陷「cell 修改提交后没有填写到表格里」）：命令的 pageIndex =
+    //   **page.index - 1**（0-based PDF 页号，pdf.getPage 的定位口径）。**不能用数组
+    //   下标**——bridge 产物/legacy 文档是懒加载的（跳页访问后 pages=[第1页,第11页]，
+    //   下标 1 = 第 11 页）⇒ 下标当页号会把 mask/strip/重绘全部画到 PDF 第 2 页
+    //   （实测：导出 PDF 第 2 页多出 20 个 item、第 11 页与原 PDF 逐字节一致）。
+    //   全量文档（index = 下标+1）二者等价 ⇒ 行为不变。缺 index ⇒ 退回下标（fail-open）。
+    const pageNo =
+      typeof (page as { index?: unknown }).index === "number" &&
+      Number.isFinite((page as { index: number }).index) &&
+      (page as { index: number }).index >= 1
+        ? (page as { index: number }).index - 1
+        : pi;
     const pageCtx: ExportContext = {
       ...ctx,
       ...pageFlipBase(page, ctx),
     };
-    for (const block of page.blocks) {
-      if (block.type !== "text") continue;
+    // ★ 2026-10-26（用户缺陷「dezembro 行导出分裂/乱位」·组键碰撞根因）：
+    //   bridge 每个 Core TextBox 产出一个 EditableBlock，但 block.id **全部沿用 legacy
+    //   blockId**（整页 = "pdf_p1_block0"）⇒ 写阶段 `key = blockId:lineIndex` 中
+    //   lineIndex 每 block 从 0 重数 ⇒ 不同 block 的第 1 行**碰撞成同一 key**
+    //   （实测：l25-L0 59 glyph + l26 16 glyph 合并成 75-glyph 组，整组按首 glyph
+    //   位置一次性绘制 ⇒ 输出乱位、文本层只剩孤立残片）。
+    //   修复 = 组键加 **block 实例序号**（`blockId#bi:li`），对每 block 实例唯一；
+    //   未携带 groupKey 的命令（legacy/签名路径）走旧键，行为不变。
+    page.blocks.forEach((block: EditableBlock, bi: number) => {
+      const groupKeyBase = `${block.id}#${bi}`;
+      // B3-C-5-C：图片对象 → DrawImageCommand（字节经 EditableBlock.image 直接携带，不经 src/fetch）
+      if (block.type === "image") {
+        if (!block.image) return;
+        const pt = cssToPdf(block.bbox, pageCtx);
+        commands.push({
+          type: "drawImage",
+          pageIndex: pageNo,
+          x: pt.x,
+          y: pt.y,
+          width: pt.width,
+          height: pt.height,
+          blockId: block.id,
+          bytes: block.image.bytes,
+          mime: block.image.mime,
+        });
+        return;
+      }
+      if (block.type !== "text") return;
       // Sprint 33.5.6: Skip signature blocks (rendered separately)
-      if (sigBlockIds.has(block.id)) continue;
+      if (sigBlockIds.has(block.id)) return;
 
       // ── Sprint34.7.1 Trace: 阶段 1 — EditableDocument 原始数据 ──
       if (typeof console !== "undefined") {
@@ -1699,9 +2218,17 @@ export function renderDocumentToExportCommands(
       }
 
       commands.push(
-        ...renderBlockToExportCommands(block, doc.styles, pageCtx, pi, editedLineBoxes, page.blocks),
+        ...renderBlockToExportCommands(
+          block,
+          doc.styles,
+          pageCtx,
+          pageNo,
+          editedLineBoxes,
+          page.blocks,
+          groupKeyBase,
+        ),
       );
-    }
+    });
   }
 
   // Sprint 33.5.6: Render signature regions with rotation
@@ -2004,6 +2531,313 @@ function tryNativeLineReplay(
   return { handled: true, isType3Line, reason: "ok" };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  F3B-6.28 · D-3B-2：整行重绘（flow 成员行 + 位移行）
+//
+//  定位：**只消费** Binding 侧 `runExportRedrawPipeline` 已算好的目标几何
+//  （PDF pt 域，与 `pdfTransform` 同域）。渲染器不重新布局、不重新断行、
+//  不做字体/编码决策 —— 那些全在 Binding 侧完成并已由 3B-1 逐行诊断验证。
+//
+//  两条绘制路径（按字符是否有**完整原始来源**分流）：
+//    ① raw-CID 直发：fontRef + CID + 目标 Tm 齐备 ⇒ 原字体 + 原字形 + 目标位置
+//       （`emitRawCidGlyphs`，既有实现，零 fontkit 依赖）；
+//    ② fallback：新增字符（原 PDF 无对应字形）⇒ 既有覆盖度管线
+//       （CID/Type0 → PNG），**绝不伪造 CID / transform**。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 重绘行的写入回执（验收取证：逐行可核对，绝不静默少画） */
+export interface RedrawLineReport {
+  readonly lineId: string;
+  readonly role: "flow-member" | "displaced-successor";
+  readonly flowIndex: number | null;
+  /** 目标字符数（= payload 字符数） */
+  readonly targetChars: number;
+  /** 走 raw-CID（原字体 + 原字形）写入的字符数 */
+  readonly rawChars: number;
+  /** 走 fallback（CID 覆盖度 → PNG）写入的字符数 */
+  readonly fallbackChars: number;
+  /** 未写入字符数（必须可观测；> 0 即该行缺字） */
+  readonly unwrittenChars: number;
+  /**
+   * F3B-6.28 · D-3B-4：被判定为「可证明的合成空白」而**有意不画**的字符数。
+   * 这些字符在原 PDF 中没有字形（pdf.js 合成空白）⇒ 无墨迹；位置由相邻字符的
+   * 绝对 Tm 保持。不计入 `unwrittenChars`（不算缺字）。
+   */
+  readonly skippedNoInkChars?: number;
+  /**
+   * F3B-6.28 · D-3B-7：新增字符经**原字体** /ToUnicode 反查 CID 后 raw 直发的数量
+   * （`rawChars` 的子集）。> 0 ⇒ 这些编辑字符与原文**同字体**（不再走兜底字体）。
+   */
+  readonly reverseCidChars?: number;
+  /** 实发字体资源名（raw 段；无 ⇒ null） */
+  readonly fontRef: string | null;
+  readonly targetBaselinePt: number | null;
+  /** 实际写入的 baseline（raw 段 = 首个 Tm 的 f 分量；无 ⇒ null） */
+  readonly writtenBaselinePt: number | null;
+  /** 实际 − 目标（PDF pt） */
+  readonly baselineErrorPt: number | null;
+  readonly fallbackPath: "none" | "cid" | "png" | "failed";
+  /** 跳过 / 失败原因（无 ⇒ null） */
+  readonly reason: string | null;
+}
+
+function isFiniteTransform6(t: readonly number[] | null | undefined): boolean {
+  return (
+    !!t && t.length >= 6 && t.every((n) => typeof n === "number" && Number.isFinite(n))
+  );
+}
+
+/**
+ * 行字号（PDF pt）。
+ *
+ * 优先级：① 原字形 Tm 的 `[a,b]` 模长（Tm 已含 fontSize 缩放 ⇒ 第一手事实）；
+ *        ② 行盒高（**全部字符都是新增**时没有 Tm 可依；flow 行盒的 CSS 高
+ *           = 该行 line-height ≈ 1em ⇒ 换算到 pt 后即字号。实测 gd-swim：
+ *           盒高 15.95pt = 原文 21.457css/1.345 = 15.95pt = 真实字号）。
+ */
+function redrawFontSizePtOf(cmd: DrawRedrawLineCommand): number {
+  for (const g of cmd.glyphs) {
+    if (isFiniteTransform6(g.pdfTransform)) {
+      const s = Math.hypot(g.pdfTransform![0]!, g.pdfTransform![1]!);
+      if (Number.isFinite(s) && s > 0) return s;
+    }
+  }
+  return Math.max(1, cmd.box.height);
+}
+
+async function drawRedrawLineToPdf(
+  pdf: PDFDocument,
+  cmd: DrawRedrawLineCommand,
+): Promise<RedrawLineReport> {
+  const page = pdf.getPage(Math.min(Math.max(cmd.pageIndex, 0), pdf.getPageCount() - 1));
+  const size = redrawFontSizePtOf(cmd);
+
+  let rawChars = 0;
+  let fallbackChars = 0;
+  /** D-3B-4：被判为「可证明合成空白」而不画的字符数（无墨迹，位置由相邻绝对 Tm 保持） */
+  let skippedNoInk = 0;
+  /**
+   * F3B-6.28 · D-3B-7：新增字符经**原字体** /ToUnicode 反查 CID 后 raw 直发的数量
+   * （rawChars 的子集；= 编辑字符与原文字体一致的数量）。
+   */
+  let reverseChars = 0;
+  let writtenBaseline: number | null = null;
+  let fontRefSeen: string | null = null;
+  let fallbackPath: RedrawLineReport["fallbackPath"] = "none";
+  const reasons: string[] = [];
+
+  // ── ①-0 原字体反查预备（D-3B-7：编辑字符与原文字体一致）────────────────
+  // 新增字符（disposition=fallback）若能在**原字体**里找到 CID，就用原字体
+  // raw-CID 直发，而不是 Liberation/Noto 兜底（CJK 文档的原字体是 CID-keyed
+  // 子集字体，fontkit 无 Unicode cmap ⇒ tryDrawNonWinAnsiAsCid 只能兜底）。
+  // CID 来源优先级：① 同行原字形同字符（PDF 自己用过的 CID，最权威）
+  //                ② 原字体 /ToUnicode 反查（单字符且无歧义才用，见模块头注）
+  type G = DrawRedrawLineCommand["glyphs"][number];
+  type Abcd = [number, number, number, number];
+  /** 行内每个原字体的供体 a..d（= 该字体原字形的缩放/旋转，保字号一致） */
+  const lineFontAbcd = new Map<string, Abcd>();
+  /** 行内原字形「字符 → (cid, fontRef)」（同行同字符 = PDF 自己的用法） */
+  const sameLineCid = new Map<string, { cid: number; fontRef: string }>();
+  for (const g of cmd.glyphs) {
+    if (
+      g.disposition !== "raw" ||
+      g.pdfCharCode === null ||
+      !Number.isFinite(g.pdfCharCode) ||
+      !g.fontRef ||
+      !isFiniteTransform6(g.pdfTransform)
+    ) {
+      continue;
+    }
+    const t = g.pdfTransform!;
+    if (!lineFontAbcd.has(g.fontRef)) lineFontAbcd.set(g.fontRef, [t[0]!, t[1]!, t[2]!, t[3]!]);
+    if ([...g.char].length === 1 && !sameLineCid.has(g.char)) {
+      sameLineCid.set(g.char, { cid: g.pdfCharCode, fontRef: g.fontRef });
+    }
+  }
+  const reverseByFont = new Map<string, Map<string, number> | null>();
+  const reverseFor = (fontRef: string): Map<string, number> | null => {
+    const cached = reverseByFont.get(fontRef);
+    if (cached !== undefined) return cached;
+    let rev: Map<string, number> | null = null;
+    try {
+      const resolveFont = makeFontDictResolver(
+        pdf,
+        page.node.get(PDFName.of("Resources")) as unknown as PDFDict,
+      );
+      // fontRef 可能带前导斜杠（源自 String(PDFName)）；资源查找用去斜杠键
+      // （与 emitRawCidGlyphs 的 `replace(/^\//, "")` 同规）
+      rev = buildReverseToUnicodeMap(resolveFont(fontRef.replace(/^\//, "")), pdf);
+    } catch {
+      rev = null;
+    }
+    reverseByFont.set(fontRef, rev);
+    return rev;
+  };
+  /** 为新增字符解析原字体 CID + 供体 a..d；找不到 ⇒ null（保持既有兜底链） */
+  const resolveOriginalCid = (
+    g: G,
+  ): { cid: number; fontRef: string; abcd: Abcd } | null => {
+    if ([...g.char].length !== 1) return null;
+    const same = sameLineCid.get(g.char);
+    // 字体选择：同行同字符的字体（最权威）⇒ 行内唯一字体 ⇒ 否则不猜（多字体且无同行同字符）
+    const fontRef = same?.fontRef ?? (lineFontAbcd.size === 1 ? [...lineFontAbcd.keys()][0]! : null);
+    if (!fontRef) return null;
+    const abcd = lineFontAbcd.get(fontRef);
+    if (!abcd) return null;
+    const cid = same && same.fontRef === fontRef ? same.cid : reverseCidOf(reverseFor(fontRef), g.char);
+    if (cid === null) return null;
+    return { cid, fontRef, abcd };
+  };
+
+  // ── ① 分段：连续同源原字形 ⇒ 一组 raw；其余 ⇒ fallback 段 ──────────────
+  type Seg =
+    | { kind: "raw"; fontRef: string; items: { cid: number; transform: [number, number, number, number, number, number] }[] }
+    | { kind: "fallback"; items: G[] };
+  const segs: Seg[] = [];
+  for (const g of cmd.glyphs) {
+    // D-3B-4 决策一：可证明的合成空白 ⇒ **不画**（原 PDF 中本无字形，画空串只会引入噪声）。
+    //   `fail` 处置已在进入本函数前由 Pass 1.5 前置校验拒绝（不会走到这里）。
+    if (g.disposition === "skip") {
+      skippedNoInk += 1;
+      continue;
+    }
+    const rawable =
+      g.disposition === "raw" &&
+      g.pdfCharCode !== null &&
+      Number.isFinite(g.pdfCharCode) &&
+      !!g.fontRef &&
+      isFiniteTransform6(g.pdfTransform);
+    const last = segs[segs.length - 1];
+    if (rawable) {
+      const t = g.pdfTransform!;
+      const item = {
+        cid: g.pdfCharCode!,
+        transform: [t[0]!, t[1]!, t[2]!, t[3]!, t[4]!, t[5]!] as [number, number, number, number, number, number],
+      };
+      if (last && last.kind === "raw" && last.fontRef === g.fontRef) last.items.push(item);
+      else segs.push({ kind: "raw", fontRef: g.fontRef!, items: [item] });
+    } else if (g.disposition === "fallback") {
+      // D-3B-7：新增字符优先原字体反查 CID（同字体 raw 直发；位置用管道算好的目标 Tm）
+      const orig = resolveOriginalCid(g);
+      if (orig) {
+        reverseChars += 1;
+        const item = {
+          cid: orig.cid,
+          transform: [...orig.abcd, g.targetXPt, g.targetBaselinePt] as [
+            number, number, number, number, number, number,
+          ],
+        };
+        if (last && last.kind === "raw" && last.fontRef === orig.fontRef) last.items.push(item);
+        else segs.push({ kind: "raw", fontRef: orig.fontRef, items: [item] });
+      } else if (last && last.kind === "fallback") last.items.push(g);
+      else segs.push({ kind: "fallback", items: [g] });
+    } else {
+      if (last && last.kind === "fallback") last.items.push(g);
+      else segs.push({ kind: "fallback", items: [g] });
+    }
+  }
+
+  for (const seg of segs) {
+    if (seg.kind === "raw") {
+      // 原字形直发：显式设黑色填充（避免继承到 mask 遗留的白色填充 ⇒ 白字不可见）。
+      try {
+        page.pushOperators(
+          PDFOperator.of(PDFOperatorNames.NonStrokingColorRgb, ["0", "0", "0"]),
+        );
+      } catch {
+        /* 显式填色失败不阻断绘制（既有 raw 路径亦不设色） */
+      }
+      emitRawCidGlyphs(page, seg.fontRef, seg.items);
+      rawChars += seg.items.length;
+      fontRefSeen = fontRefSeen ?? seg.fontRef;
+      if (writtenBaseline === null) writtenBaseline = seg.items[0]!.transform[5];
+      continue;
+    }
+
+    // ── ② fallback 段：新增字符（无原始 provenance）─────────────────────
+    const text = seg.items.map((g) => g.char).join("");
+    if (!text) continue;
+    const first = seg.items[0]!;
+    // 段宽：由相邻字符的目标 x 差推导逐字 advance（末字沿用前一个 advance）。
+    let width = 0;
+    for (let i = 0; i < seg.items.length - 1; i += 1) {
+      width += seg.items[i + 1]!.targetXPt - seg.items[i]!.targetXPt;
+    }
+    const adv =
+      seg.items.length > 1
+        ? width / (seg.items.length - 1)
+        : Math.max(size, cmd.box.height / 1.35);
+    width += adv;
+
+    let drawn = false;
+    try {
+      drawn = await tryDrawNonWinAnsiAsCid({
+        pdf,
+        page,
+        pageIndex: cmd.pageIndex,
+        text,
+        fontIdentity: fontRefSeen ? ({ fontRef: fontRefSeen } as GlyphFontIdentity) : undefined,
+        x: first.targetXPt,
+        y: first.targetBaselinePt,
+        size,
+        color: { r: 0, g: 0, b: 0 },
+      });
+    } catch (e) {
+      reasons.push(`CID fallback 异常：${String(e)}`);
+    }
+    if (drawn) {
+      fallbackPath = fallbackPath === "png" ? "png" : "cid";
+      fallbackChars += seg.items.length;
+      if (writtenBaseline === null) writtenBaseline = first.targetBaselinePt;
+      continue;
+    }
+    try {
+      const png = await textToPngForExport(text, size, cmd.blockId);
+      if (png) {
+        const img = await pdf.embedPng(png);
+        page.drawImage(img, {
+          x: first.targetXPt,
+          y: cmd.box.y,
+          width: Math.max(1, width),
+          height: Math.max(1, cmd.box.height),
+        });
+        drawn = true;
+        fallbackPath = "png";
+        fallbackChars += seg.items.length;
+        if (writtenBaseline === null) writtenBaseline = first.targetBaselinePt;
+      }
+    } catch (e) {
+      reasons.push(`PNG fallback 异常：${String(e)}`);
+    }
+    if (!drawn) reasons.push(`fallback 段未写入：${JSON.stringify(text.slice(0, 12))}`);
+  }
+
+  // 未写入 = 总数 − raw − fallback − **跳过的合成空白**（后者无墨迹，位置由相邻绝对 Tm 保持，
+  // 不算缺字；3B-1 已证明这些字符在原 PDF 中没有字形）。
+  const unwritten = Math.max(0, cmd.glyphs.length - rawChars - fallbackChars - skippedNoInk);
+  if (unwritten > 0 && reasons.length === 0) {
+    reasons.push(`${unwritten} 个字符既无原始来源也未写入（fallback 全部失败）`);
+  }
+  return {
+    lineId: cmd.lineId,
+    role: cmd.role,
+    flowIndex: cmd.flowIndex,
+    targetChars: cmd.glyphs.length,
+    rawChars,
+    fallbackChars,
+    unwrittenChars: unwritten,
+    skippedNoInkChars: skippedNoInk,
+    reverseCidChars: reverseChars,
+    fontRef: fontRefSeen,
+    targetBaselinePt: cmd.baselinePt,
+    writtenBaselinePt: writtenBaseline,
+    baselineErrorPt:
+      writtenBaseline === null ? null : Math.round((writtenBaseline - cmd.baselinePt) * 1000) / 1000,
+    fallbackPath: unwritten > 0 ? "failed" : fallbackPath,
+    reason: reasons.length > 0 ? reasons.join(" | ") : null,
+  };
+}
+
 export async function writeExportCommandsToPDF(
   pdf: PDFDocument,
   commands: ExportCommand[],
@@ -2024,7 +2858,9 @@ export async function writeExportCommandsToPDF(
   if (nativeRouting) {
     commands = filterOverlayForNativeReplaced(commands, nativeRouting);
   }
-  const { textGlyphs, lines, images, redactions } = groupExportCommands(commands);
+  const { textGlyphs, lines, images, redactions, redrawLines } = groupExportCommands(commands);
+  /** F3B-6.28 · D-3B-2：逐条重绘行的写入回执（验收取证用，见 drawRedrawLineToPdf） */
+  const redrawReports: RedrawLineReport[] = [];
   // M7.8-022A: 入口计数诊断 —— 确认 commands 是否抵达本函数、以及 glyph/mask 各有多少。
   // 若本行出现但 [PDFdraw] 未出现，说明 textGlyphs 在此后被清空或未进入绘制循环。
   if (typeof console !== "undefined") {
@@ -2072,10 +2908,16 @@ export async function writeExportCommandsToPDF(
 
   // Sprint34.7: 按 blockId + lineIndex 分组 glyph，逐 line 导出，禁止 export 阶段重新 wrap。
   // 仅当 glyph 带 lineIndex 时逐行；否则回退到旧逻辑（整 block 拼接）。
-  type LineKey = string; // "blockId:lineIndex"
+  type LineKey = string; // "blockId:lineIndex"（或组键碰撞修复后的 "blockId#bi:li"）
   const lineGlyphs = new Map<LineKey, DrawTextGlyphCommand[]>();
   for (const cmd of textGlyphs) {
-    const key = cmd.lineIndex !== undefined ? `${cmd.blockId}:${cmd.lineIndex}` : cmd.blockId;
+    // ★ 2026-10-26 组键碰撞修复：bridge 每个 Core TextBox 产出一个 block 且 block.id
+    //   沿用 legacy blockId（整页同名）⇒ 旧键 `blockId:lineIndex` 中 lineIndex 每 block
+    //   从 0 重数 ⇒ 不同 block 的第 1 行并成一组（实测 75-glyph 组整组按首 glyph 位置
+    //   一次性绘制 ⇒ 乱位/文本层只剩残片）。携带 groupKey（block 实例唯一）的命令优先。
+    const key =
+      (cmd as { groupKey?: string }).groupKey ??
+      (cmd.lineIndex !== undefined ? `${cmd.blockId}:${cmd.lineIndex}` : cmd.blockId);
     const arr = lineGlyphs.get(key) || [];
     arr.push(cmd);
     lineGlyphs.set(key, arr);
@@ -2095,6 +2937,11 @@ export async function writeExportCommandsToPDF(
   //     统一走 Standard 14 / PNG overlay 路径（Phase C 对编辑行有 CID 编码风险）。
   //
   const editedLineKeys = new Set<LineKey>();
+  // F3B-6.28 · D-3B-4（决策三）：完整清除 + 成功重绘的行不再依赖 mask ⇒ mask 跳过。
+  //   ⚠️ 必须**早于** mask 循环声明（TDZ：const 在声明前引用会抛 ReferenceError）。
+  const redrawLineKeys = new Set<string>(
+    redrawLines.map((r) => `${r.blockId}:${r.lineIndex}`),
+  );
   let totalGlyphs = 0;
   let modifiedGlyphCount = 0;
   for (const [key, glyphs] of lineGlyphs) {
@@ -2129,16 +2976,11 @@ export async function writeExportCommandsToPDF(
     const firstGlyph = glyphs[0];
     const pageIdxForLine = Math.min(firstGlyph.pageIndex ?? 0, pdf.getPageCount() - 1);
     const page = pdf.getPage(pageIdxForLine);
-    // M7.8-042-REPLAY-NONEMBED：放开「仅嵌入字体/Type3」门禁。
-    // 非嵌入字体（如 /FT8 SimSun）的原字体资源、编码、/ToUnicode 都在 PDF 里，
-    // native replay 只是按原 charCode + 原 Tm 重写内容流 —— 与嵌入字体完全同构，
-    // 由查看器的替换字体渲染，字距与原文一致。排除它导致整行回落 Helvetica overlay
-    // → 字形宽于原字体 → 字符重叠「粘在一起」（用户报告的行内字距压缩根因）。
-    // 安全性不变：未改动 glyph 用原始 charCode；改动 glyph 走 /ToUnicode 反查，
-    // 失败 → findFontForChar → 仍失败 → unrecoverable → 整行回落 overlay（原行为）。
+    const isType3 = firstGlyph.fontIdentity?.subtype === "Type3";
+    const isEmbedded = firstGlyph.fontIdentity?.embedded && !isType3;
     const hasFontRef = !!firstGlyph.fontIdentity?.fontRef;
     const allHaveTransform = glyphs.every((g) => Array.isArray(g.glyphMetrics?.pdfTransform));
-    if (hasFontRef && allHaveTransform) {
+    if (hasFontRef && allHaveTransform && (isEmbedded || isType3)) {
       const isEditedLine = glyphs.some((g) => g.modified);
       if (isEditedLine) {
         const replay = tryNativeLineReplay(page, pdf, pageIdxForLine, glyphs);
@@ -2173,6 +3015,10 @@ export async function writeExportCommandsToPDF(
     // M7.8-FIX：已 native replay 成功原位替换的行（replayedKeys）→ 旧文本已消失，
     //   同样无需 mask；画 mask 只会白白擦掉该行的表格线（用户报告 bug）。
     if (maskKey && replayedKeys.has(maskKey)) continue;
+    // F3B-6.28 · D-3B-4（决策三）：完整清除 + 成功重绘的行**不再依赖 mask**。
+    //   这些行的原算子已被 strip 从内容流移除（Pass 1.5 落笔前已逐行核验），
+    //   画 mask 只会白白擦掉行内表格线 / 边框线。
+    if (maskKey && redrawLineKeys.has(maskKey)) continue;
 
     const pageIdx = cmd.pageIndex ?? 0;
     const page = pdf.getPage(Math.min(pageIdx, pdf.getPageCount() - 1));
@@ -2187,6 +3033,119 @@ export async function writeExportCommandsToPDF(
         borderWidth: 0,
       });
     }
+  }
+
+  // ── Pass 1.5: F3B-6.28 · D-3B-2/D-3B-4 整行重绘（flow 成员行 + 位移行）─────
+  //   · 只消费 Binding 侧算好的几何（**绝不在 renderer 内重新布局**）；
+  //   · 原字符有完整来源 ⇒ raw-CID 直发（原字体 + 原字形 + 目标 Tm）；
+  //   · 新增字符无来源 ⇒ 既有 fallback 覆盖度管线（CID/Type0 → PNG），**绝不伪造 CID/transform**；
+  //   · D-3B-4（决策一）无 provenance 的原字符：可证明的合成空白 ⇒ 跳过；其它 ⇒ 拒绝导出。
+  if (typeof console !== "undefined") {
+    console.log(`[F3B-6.28][3B2-REDRAW-COUNT] drawRedrawLineCommands=${redrawLines.length}`);
+  }
+  try {
+    (globalThis as unknown as Record<string, unknown>).__d3b2RedrawCount = redrawLines.length;
+  } catch {
+    /* ignore */
+  }
+
+  // ── D-3B-4 决策三：重绘落笔**之前**逐行核验「原算子已完整剥离」────────────
+  //   为什么必须放在这里：此刻内容流里只有「已剥离的原始算子」（strip 在
+  //   `exportEditableDocument` 里先于本函数执行，重绘尚未落笔）⇒ 该行原始 baseline
+  //   附近的任何非空 showText 只能是**没剥干净**的原文。放到重绘之后就会与其它行的
+  //   重绘算子混淆（位移行的目标 baseline 正好是下一行的原 baseline）。
+  //   任一行不满足 ⇒ 抛 ExportRedrawGateError ⇒ **整体拒绝导出**（不产出 PDF），
+  //   绝不「画 mask 盖住、再重绘」—— mask 是遮盖手段，不是清除完整性证明。
+  if (redrawLines.length > 0) {
+    const byPage = new Map<number, DrawRedrawLineCommand[]>();
+    for (const rcmd of redrawLines) {
+      const arr = byPage.get(rcmd.pageIndex) ?? [];
+      arr.push(rcmd);
+      byPage.set(rcmd.pageIndex, arr);
+    }
+    for (const [pageIdx, cmds] of byPage) {
+      const page = pdf.getPage(Math.min(pageIdx, pdf.getPageCount() - 1));
+      const ops = collectShowTextOps(pdf, page);
+      const bad = findIncompletelyClearedLines(ops, cmds);
+      if (bad.length > 0) {
+        throw new ExportRedrawGateError(
+          "clear-incomplete",
+          `F3B-6.28 · D-3B-4：以下重绘行的原始算子未完整剥离（拒绝导出，不用 mask 掩盖）：${bad
+            .map((b) => `${b.lineId.slice(-6)}@${b.atBaselinePt} 残留${b.residualChars}字符`)
+            .join("; ")}`,
+          { bad },
+        );
+      }
+    }
+    if (typeof console !== "undefined") {
+      console.log("[F3B-6.28][3B4-CLEAR-VERIFY] 全部重绘行的原始算子已完整剥离");
+    }
+  }
+
+  // D-3B-4 决策三（续）：清除完整 + 重绘完整的行**不再依赖 mask** ⇒ 其 mask 跳过
+  // （`redrawLineKeys` 已在函数前段声明；原算子已从内容流消失，画 mask 只会白白擦掉行内表格线）。
+
+  for (const rcmd of redrawLines) {
+    // D-3B-4 决策一：fail 处置 ⇒ 该行拒绝（原字符缺来源且不是可证明的合成空白）
+    const failedGlyphs = rcmd.glyphs.filter((g) => g.disposition === "fail");
+    if (failedGlyphs.length > 0) {
+      throw new ExportRedrawGateError(
+        "glyph-missing-source",
+        `F3B-6.28 · D-3B-4：行 ${rcmd.lineId.slice(-6)} 有 ${failedGlyphs.length} 个原字符缺来源且非合成空白（${failedGlyphs
+          .slice(0, 3)
+          .map((g) => JSON.stringify(g.char))
+          .join(",")}）⇒ 拒绝导出（不得默认跳过）`,
+        { lineId: rcmd.lineId, chars: failedGlyphs.map((g) => g.char) },
+      );
+    }
+    try {
+      const report = await drawRedrawLineToPdf(pdf, rcmd);
+      redrawReports.push(report);
+      if (typeof console !== "undefined") {
+        console.log(
+          `[F3B-6.28][3B2-REDRAW] ${report.lineId.slice(-6)} role=${report.role} flow=${report.flowIndex} ` +
+            `chars=${report.targetChars} raw=${report.rawChars} fallback=${report.fallbackChars} ` +
+            `unwritten=${report.unwrittenChars} font=${report.fontRef ?? "none"} ` +
+            `cid=${report.rawChars}/${report.targetChars} fallbackPath=${report.fallbackPath} ` +
+            `reverseCid=${report.reverseCidChars ?? 0} ` +
+            `targetBase=${report.targetBaselinePt} writtenBase=${report.writtenBaselinePt} ` +
+            `err=${report.baselineErrorPt} reason=${report.reason ?? "-"}`,
+        );
+      }
+    } catch (e) {
+      redrawReports.push({
+        lineId: rcmd.lineId,
+        role: rcmd.role,
+        flowIndex: rcmd.flowIndex,
+        targetChars: rcmd.glyphs.length,
+        rawChars: 0,
+        fallbackChars: 0,
+        unwrittenChars: rcmd.glyphs.length,
+        fontRef: null,
+        targetBaselinePt: rcmd.baselinePt,
+        writtenBaselinePt: null,
+        baselineErrorPt: null,
+        fallbackPath: "failed",
+        reason: `重绘异常：${String(e)}`,
+      });
+      console.warn("[F3B-6.28][3B2-REDRAW] 重绘失败（该行不会出现在导出中）：", rcmd.lineId, e);
+    }
+  }
+  // D-3B-4：任一行未写入 ⇒ 该行会缺字 ⇒ **整体拒绝导出**（不产出缺行 PDF）
+  const notDrawn = redrawReports.filter((r) => r.unwrittenChars > 0 || r.fallbackPath === "failed");
+  if (notDrawn.length > 0) {
+    throw new ExportRedrawGateError(
+      "line-not-drawn",
+      `F3B-6.28 · D-3B-4：以下重绘行未完整写入（拒绝导出）：${notDrawn
+        .map((r) => `${r.lineId.slice(-6)}(unwritten=${r.unwrittenChars},path=${r.fallbackPath})`)
+        .join("; ")}`,
+      { notDrawn: notDrawn.map((r) => r.lineId) },
+    );
+  }
+  try {
+    (globalThis as unknown as Record<string, unknown>).__d3b2Redraw = redrawReports;
+  } catch {
+    /* ignore */
   }
 
   // ── Pass 2: Overlay（仅编辑行）──
@@ -2227,22 +3186,139 @@ export async function writeExportCommandsToPDF(
           `%c[Sprint34.7.1][PDFdraw] key=${key} text="${text}" x=${drawX} y=${drawY} size=${Math.round(firstGlyph.fontSize * 10) / 10} charCount=${text.length}`,
           "font-weight:bold;color:#22c55e;",
         );
-        const pageH = getPageHeight(firstGlyph.pageIndex ?? 0);
-        console.log(
-          `%c[M7.8-022A][COORD_DIAG] key=${key} ptY=${Math.round(firstGlyph.y * 10) / 10} ` +
-            `ptH=${Math.round((firstGlyph.height ?? 0) * 10) / 10} ` +
-            `pageHeightPt=${Math.round(pageH * 10) / 10} ` +
-            `→ cssInkBottom≈${Math.round((pageH - firstGlyph.y) * 10) / 10}（scale 未知，需乘 renderScale*cssScale）`,
-          "color:#f59e0b;",
-        );
       } catch {
         /* 诊断日志绝不能影响渲染 */
       }
     }
 
     if (requiresFallback) {
-      // Unicode fallback（超出 WinAnsi 范围）：Canvas → PNG → embedPng
-      // 用于 CJK、emoji 等 pdf-lib WinAnsi 编码无法表示的字符。
+      // ── F3B-6.17-3C-10C.3B-F2-A：优先尝试 **CID/Type0 矢量文本**（可搜索/可复制）──
+      //   背景（F1 已锁定）：非 WinAnsi 一律走 PNG ⇒ 文本层丢失（不可搜索/复制）。
+      //   F2 Phase 1 PoC 已证明：
+      //     · CID 管线本身成立（Type0 + Identity-H + ToUnicode + FontFile2）
+      //     · 但 005D 的 hex（Unicode-as-CID）与 pdf-lib subset 的真实 CID **不兼容**
+      //     · 手写 BT/Tf/Tm/Tj 算子也**不可提取**
+      //     ⇒ 正确承接 = pdf-lib 的字形编码 + 资源注册路径（assembleCidFont + drawText）
+      //   字体覆盖不到的字符类（CJK / emoji / Arabic）⇒ 返回 false，**保持 PNG 兜底**。
+      //
+      // ★ Step 5B：把该行的**原 PDF 字体身份**一并传下去。
+      //   此前调用点只有 {pdf,page,text,x,y,size,color} —— 完全没有字体信息，
+      //   于是 CJK 被 CID_FALLBACK_FONTS 里的 NotoSansSC 无条件接管（导出产物多出一个
+      //   字体、字形与原 FangSong 不一致）。此处只补字体来源，**x/y/size 定位语义不变**。
+      //   来源优先级：行级 export provenance（编辑行唯一可得）→ glyph 级测量 provenance（未编辑行）。
+      const fontIdentity =
+        firstGlyph.originalFontIdentity ??
+        firstGlyph.fontIdentity ??
+        firstGlyph.glyphMetrics?.fontIdentity;
+      let cidDrawn = false;
+      // ── P0-EXPORT-FONT-2 ②：original-raw / fallback 分片接线（FONT-1 判定 B）──
+      //   fontkit 无法解析原 CID Type0 子集 ⇒ 原字符不能走 assembleCidFont；
+      //   但原 glyph 自带第一手 raw-CID 事实（pdfCharCode + pdfTransform）
+      //   ⇒ 原字符段直发 emitRawCidGlyphs（绝对矩阵，零 fontkit 依赖，provenance 保留），
+      //     新字符段仍走既有 fallback 覆盖度管线（planCidCoverageRuns 语义不变）。
+      //
+      //   ★ 顺序安全：raw 用绝对 Tm ⇒ 与绘制先后无关；先画 fallback 段（可能失败），
+      //     任一失败 ⇒ 整行放弃（交回 PNG 兜底），绝不出现「半行已画」的双写。
+      //   ★ 几何不变量：raw 段 cid/transform/x/y 与 glyph 第一手值逐位相等。
+      // ★ 输入投影：与 renderer 既有读取口径一致（顶层 ?? glyphMetrics）——
+      //   浏览器 glyph 的 raw-CID 事实可能在 glyphMetrics 里，缺这一步 ⇒ 全误判 fallback。
+      const __splitInput = glyphs.map((g: any) => ({
+        char: g.char,
+        pdfCharCode: g.pdfCharCode ?? g.glyphMetrics?.pdfCharCode,
+        pdfTransform: g.pdfTransform ?? g.glyphMetrics?.pdfTransform,
+      }));
+      const __splitRuns = splitOriginalRawRuns(__splitInput);
+      const __hasRaw = __splitRuns.some((r) => r.kind === "original-raw");
+      if (__hasRaw) {
+        const rawFontRef = (
+          firstGlyph.originalFontIdentity?.fontRef ??
+          firstGlyph.fontIdentity?.fontRef ??
+          ""
+        ).replace(/^\//, "");
+        let fbOk = true;
+        let gi = 0;
+        // RAW-FALLBACK-01 · 修正 2 A-direct（受控分支，默认关）：同行 raw glyph 的
+        // pdfTransform[5] = 第一手 PDF 基线 ⇒ drawText y 直通（PDF 域，零换算），
+        // 与 raw 直发共用同一基线定义。参考缺失 ⇒ undefined ⇒ 回退既有 y 语义。
+        const directRawPdfY = isRawFallbackDirectBaselineEnabled()
+          ? resolveDirectRawPdfY(glyphs)
+          : undefined;
+        for (const r of __splitRuns) {
+          if (r.kind === "original-raw") {
+            gi += r.glyphs.length;
+            continue;
+          }
+          // fallback 段：取该段首个 glyph 的定位（既有 tryDrawNonWinAnsiAsCid 语义）
+          const seg: typeof glyphs = [];
+          while (gi < glyphs.length && classifyGlyphForExport(glyphs[gi]!) === "fallback") {
+            seg.push(glyphs[gi]!);
+            gi += 1;
+          }
+          const segFirst = seg[0]!;
+          const ok = await tryDrawNonWinAnsiAsCid({
+            pdf,
+            page,
+            pageIndex: pageIdxForLine,
+            text: r.text,
+            fontIdentity,
+            x: segFirst.x,
+            y:
+              typeof directRawPdfY === "number"
+                ? directRawPdfY
+                : typeof segFirst.baseline === "number" && Number.isFinite(segFirst.baseline)
+                  ? segFirst.baseline
+                  : segFirst.y,
+            size: segFirst.fontSize,
+            color: hexToRgb(segFirst.color) || { r: 0, g: 0, b: 0 },
+          });
+          if (!ok) {
+            fbOk = false;
+            break;
+          }
+        }
+        if (fbOk) {
+        for (const r of __splitRuns) {
+          if (r.kind !== "original-raw") continue;
+          if (!rawFontRef) {
+              fbOk = false; // 无 fontRef ⇒ raw 无法直发，交回整行兜底（绝不半行）
+              break;
+            }
+            emitRawCidGlyphs(
+              page,
+              rawFontRef,
+              r.glyphs.map((g) => ({
+                cid: g.cid,
+                transform: [...g.transform] as [number, number, number, number, number, number],
+              }))
+            );
+          }
+          if (fbOk) cidDrawn = true;
+        }
+      }
+      if (!cidDrawn) {
+        try {
+          cidDrawn = await tryDrawNonWinAnsiAsCid({
+          pdf,
+          page,
+          pageIndex: pageIdxForLine,
+          text,
+          fontIdentity,
+          x: firstGlyph.x,
+          y:
+            typeof firstGlyph.baseline === "number" && Number.isFinite(firstGlyph.baseline)
+              ? firstGlyph.baseline
+              : firstGlyph.y,
+          size: firstGlyph.fontSize,
+          color: hexToRgb(firstGlyph.color) || { r: 0, g: 0, b: 0 },
+        });
+      } catch (e) {
+        console.warn("[ExportRenderer] CID text export failed, fallback to PNG:", key, e);
+      }
+      } // ★ P0-EXPORT-FONT-2 ②：if (!cidDrawn) 分片回退闭合
+      if (cidDrawn) continue; // ★ 已用矢量文本绘制（文本层存在）⇒ 不做 PNG 栅格化
+
+      // Unicode fallback（超出 WinAnsi 范围 且 无字体覆盖）：Canvas → PNG → embedPng
+      // 用于 CJK、emoji、Arabic 等「当前字体资产无法覆盖」的字符。
       try {
         const pngBytes = await textToPngForExport(
           text,
@@ -2321,7 +3397,12 @@ export async function writeExportCommandsToPDF(
       const isType3 = firstGlyph.fontIdentity?.subtype === "Type3";
       const isEmbedded = firstGlyph.fontIdentity?.embedded && !isType3;
       const hasFontRef = !!firstGlyph.fontIdentity?.fontRef;
-      const allHaveTransform = glyphs.every((g) => Array.isArray(g.glyphMetrics?.pdfTransform));
+      // RAW-CID-01：transform 读取契约统一（与 L2473 同口径）——g.pdfTransform
+      // （rawProv 推进值）优先，缺失/无效时回退 glyphMetrics；两者均无效 ⇒ 该行
+      // 不满足 raw 直发前提 ⇒ fail-closed 走下方 Standard 14 兜底（不发出坏 Tm）。
+      const allHaveTransform = glyphs.every(
+        (g) => isValidPdfTransform(g.pdfTransform) || isValidPdfTransform(g.glyphMetrics?.pdfTransform),
+      );
 
       if (hasFontRef && allHaveTransform && (isEmbedded || isType3)) {
         // ── M7.8-041-FIX-R4：编辑行优先用「原 PDF 嵌入字体」原生重放 ──
@@ -2343,10 +3424,17 @@ export async function writeExportCommandsToPDF(
             (g) => typeof (g.pdfCharCode ?? g.glyphMetrics?.pdfCharCode) === "number" && !g.modified,
           );
           if (allHaveCharCode) {
-            const rawGlyphs = glyphs.map((g) => ({
-              cid: (g.pdfCharCode ?? g.glyphMetrics!.pdfCharCode)!,
-              transform: g.glyphMetrics!.pdfTransform as [number, number, number, number, number, number],
-            }));
+            const rawGlyphs = glyphs.map((g) => {
+              // RAW-CID-01：g.pdfTransform（rawProv 推进后的绝对逐字符坐标）优先，
+              // 回退 glyphMetrics（旧通道）。allHaveTransform 已保证至少一个有效。
+              const t = isValidPdfTransform(g.pdfTransform)
+                ? g.pdfTransform
+                : g.glyphMetrics!.pdfTransform;
+              return {
+                cid: (g.pdfCharCode ?? g.glyphMetrics!.pdfCharCode)!,
+                transform: [...t] as [number, number, number, number, number, number],
+              };
+            });
             emitRawCidGlyphs(page, fontRef, rawGlyphs);
             continue;
           }
@@ -2362,9 +3450,6 @@ export async function writeExportCommandsToPDF(
       // 表现为「显示丢字 / 复制出旧文本」。改为逐 glyph 绘制，每个 glyph 用其自身字体身份；
       // 编辑过（新增）或原子集无法编码的字符回退 Standard 14，保证字符可见。
       for (const g of glyphs) {
-        const gIdentity = g.fontIdentity ?? g.glyphMetrics?.fontIdentity;
-        const gFontName =
-          gIdentity?.fontName || g.glyphMetrics?.fontIdentity?.fontName || g.fontFamily;
         // overlay 路径（含编辑字符的行）必须保证新文本可见：直接使用 pdf-lib 内建
         // Standard 14 字体（无需外部字体文件），避免 resolveEmbeddedFont 映射到的
         // 替代字体在部分环境缺失导致字形丢失。整行重绘时保真度让位于正确性。
@@ -2394,12 +3479,6 @@ export async function writeExportCommandsToPDF(
           lineHeight: g.fontSize * 1.3,
         };
         if (Math.abs(gRot) > 0.01) gOpts.rotate = degrees(-gRot);
-        if (typeof console !== "undefined") {
-          console.log(
-            `%c[Sprint40-fix][DrawGlyph] "${gt}" font=${gFontName} x=${Math.round(g.x)} y=${Math.round(g.y)}`,
-            "color:#a855f7;",
-          );
-        }
         page.drawText(gt, gOpts);
       }
     }
@@ -2408,18 +3487,31 @@ export async function writeExportCommandsToPDF(
   // 写入图片
   for (const cmd of images) {
     try {
-      const resp = await fetch(cmd.src);
-      const bytes = new Uint8Array(await resp.arrayBuffer());
-      const img = resp.headers.get("content-type")?.includes("png")
-        ? await pdf.embedPng(bytes)
-        : await pdf.embedJpg(bytes);
+      // B3-C-5-C：优先走 bytes 路径（Core 图片导出，assetRef 解析后的原始字节）；
+      // legacy / 签名路径仍走 src（fetch）。两条路径互不干扰。
+      let bytes: Uint8Array | null = null;
+      let isPng = true;
+      if (cmd.bytes) {
+        bytes = cmd.bytes;
+        isPng = (cmd.mime ?? "image/png").toLowerCase() === "image/png";
+      } else if (cmd.src) {
+        const resp = await fetch(cmd.src);
+        bytes = new Uint8Array(await resp.arrayBuffer());
+        isPng = resp.headers.get("content-type")?.includes("png") ?? true;
+      }
+      if (!bytes) {
+        console.warn("[ExportRenderer] Image export skipped (no bytes/src):", cmd.blockId);
+        continue;
+      }
+      const img = isPng ? await pdf.embedPng(bytes) : await pdf.embedJpg(bytes);
       const page = pdf.getPage(Math.min(cmd.pageIndex ?? 0, pdf.getPageCount() - 1));
       const rot = (cmd as DrawImageCommand).rotation ?? 0;
-      if (Math.abs(rot) > 0.01) {
+      if (Math.abs(rot) > 0.01 && cmd.src) {
         // Sprint34.11: 图片绕 bbox 左上角 (cmd.x, cmd.y) 旋转。
         // 与 glyph 一致：CSS 顺时针为正 → PDF 逆时针为负（取 -rotation）。
         // pdf-lib drawImage 不支持任意 transform 矩阵，改用 canvas 预旋转出新的倾斜 PNG，
-        // 再平铺 drawImage（图片内容方向已正确）。
+        // 再平铺 drawImage（图片内容方向已正确）。旋转仅 legacy src 路径支持；
+        // bytes 路径旋转留待 C5-D / C5-E（默认 import 图片 rotation=0，不受影响）。
         const rotatedBytes = await rotateImageBytes(cmd.src, rot);
         if (rotatedBytes) {
           const rimg = await pdf.embedPng(rotatedBytes);
@@ -2534,27 +3626,21 @@ export async function exportEditableDocument(
   // M7.7-004A：Native First —— 存在 native-ready 行（编辑态已绑定原生算子）且 Overlay 策略（原始 PDF 为源）时，
   // 走原生改写（Tj/TJ 原位替换 + 写回内容流）+ 仅对未 ready 行 overlay，避免 Helvetica fallback。
   if (strategy.name === "overlay" && originalBytes) {
-    // M7.7-006 hardening: 测试门 __forceOverlay=process.env.STRIP_DIAG === "1" 时跳过 native-first，强制 Overlay（mask+重绘）路径，
-    // 用于专门验证 overlay 视觉保真（mask/CJK-PNG/旋转）。
-    // M7.8-022A: 默认改为「禁用 native rewrite」（__nativeRewrite !== process.env.STRIP_DIAG === "1" 即禁用）。
-    //   根因：composeReplacementOperator（replace-text-operator.ts）无条件把 TJ 重建为
-    //   单元素数组 `[(全文)] TJ`，原 PDF TJ 数组中的字距调整（kerning）数字全部丢失；
-    //   且改写的行会被 deriveNativeRoutingFromBlock 判为 native-ready → skipOverlay，
-    //   不再生成任何 overlay 命令 → 导出既无 mask 也无重绘，错位的文字直接来自被改写的
-    //   内容流（用户报告：修改行下移 / 换行 / 露出原文 / 侵占下一行）。
-    //   该缺陷与替换是否等长无关（等长同样丢字距），故不能仅按长度放行。
-    //   恢复方式：运行时设 globalThis.__nativeRewrite = process.env.STRIP_DIAG === "1"。
-    const nativeRewriteEnabled =
-      (globalThis as unknown as { __nativeRewrite?: boolean })?.__nativeRewrite === process.env.STRIP_DIAG === "1";
-    const forceOverlay =
-      !nativeRewriteEnabled ||
-      (globalThis as unknown as { __forceOverlay?: boolean })?.__forceOverlay === process.env.STRIP_DIAG === "1";
-    if (forceOverlay && typeof console !== "undefined") {
-      console.log(
-        "[M7.8-022A][NATIVE_DISABLED] native rewrite 已禁用 → 强制 overlay（mask + 逐 glyph 重绘）",
-        "color:#f59e0b;font-weight:bold;",
-      );
-    }
+    // ★ native rewrite **恒禁用**（用户裁决，固化禁用策略；勿改回表达式形式重新启用）。
+    //   禁用原因（M7.8-022A）：
+    //   · composeReplacementOperator（replace-text-operator.ts）无条件把 TJ 重建为
+    //     单元素数组 `[(全文)] TJ`，原 PDF TJ 数组中的字距调整（kerning）数字全部丢失；
+    //   · 且改写的行会被 deriveNativeRoutingFromBlock 判为 native-ready → skipOverlay，
+    //     不再生成任何 overlay 命令 → 导出既无 mask 也无重绘，错位的文字直接来自被改写的
+    //     内容流（用户报告：修改行下移 / 换行 / 露出原文 / 侵占下一行 / 表格列错位）。
+    //   · 该缺陷与替换是否等长无关（等长同样丢字距），故不能仅按长度放行。
+    //   依据既有 ee53f17 回滚裁决，**不得**通过修复比较表达式或设置运行时开关重新启用；
+    //   重新启用前必须先修 composeReplacementOperator 的 TJ kerning 重建，并补齐回归测试。
+    //   （历史：曾用 globalThis.__nativeRewrite / __forceOverlay 作 opt-in/测试门，
+    //     后被误写成 `x === process.env.STRIP_DIAG === "1"` 链式比较 ⇒ 恒 false；
+    //     恰与禁用意图一致，现已显式固化。两者全仓 0 写入方，已随本次清理移除。）
+    const nativeRewriteEnabled = false;
+    const forceOverlay = true;
     const hasNativeReady = !forceOverlay && doc.pages.some((p) =>
       p.blocks.some((b) => {
         const r = deriveNativeRoutingFromBlock(b);
@@ -2617,7 +3703,8 @@ export async function exportEditableDocument(
     stripResult.fullyStrippedLines,
   );
 
-  return await pdf.save();
+  const savedBytes = await pdf.save();
+  return savedBytes;
 }
 
 // ── 辅助函数 ──
@@ -2688,6 +3775,349 @@ function sanitizeWinAnsi(text: string): string {
  *
  * 中文/日文/emoji 等超出 0xFF 的字符返回 true，走 PNG fallback。
  */
+// ─────────────────────────────────────────────────────────────────────
+//  F3B-6.17-3C-10C.3B-F2-A · 非 WinAnsi 的 CID/Type0 承接
+// ─────────────────────────────────────────────────────────────────────
+//
+//  ★ 设计原则（用户裁决，不得违反）：**不要**把 PNG fallback 简单替换成「手写 CID 算子」。
+//    F2 Phase 1 PoC（`document-model/export-cid-readiness.test.ts`）已证明：
+//      1. `assembleCidFont`（005E-B）能产出完整 Type0/Identity-H/ToUnicode/FontFile2 ✓
+//      2. 005D 的 hex（Unicode-as-CID）≠ pdf-lib subset 的真实 CID ⇒ **不可直接接线**
+//      3. 手写 `BT /F1 Tf … <hex> Tj ET` ⇒ pdf.js **提取不到文本**
+//      4. 只有 pdf-lib 的字形编码 + 资源注册路径（`drawText`）能闭环
+//    ⇒ 本函数走 4；且**只在字体覆盖该文本时**启用，否则返回 false 保持 PNG 兜底。
+//
+//  字体资产：仓库内目前只有 Liberation Sans（Latin-1 + Cyrillic + Greek）。
+//    ⇒ Cyrillic 现在就能修；CJK / emoji / Arabic 覆盖不到 ⇒ 仍走 PNG（G3 资产问题，
+//       不在本轮解决，不得为此临时引入 Noto）。
+
+/**
+ * CID 候选字体资产（Export-only；`public/` 目录 ⇒ **导出时按需 fetch**，
+ * 不进 JS bundle、不影响 App 打开成本）。
+ *
+ * ★ 选择策略：**按字符覆盖**逐个候选试（**不是**「> U+00FF 就上 CJK 字体」）——
+ *   否则会把不同字符类别错误地绑到同一字体（Cyrillic/Arabic/Emoji 各有自己的问题）。
+ *
+ * G3-A 资产裁决（用户）：OTF/CFF 作为 Export 资产（subset 后 PDF 增量稳定 ~42 KB）；
+ *   WOFF2 候选的 subset 异常增量（首例 +1.28 MB）已单独登记 **G3-A-FONT-001**，本轮不处理。
+ */
+const CID_FALLBACK_FONTS: ReadonlyArray<{ url: string; baseFont: string; subtype: "TrueType" | "OpenType" }> = [
+  { url: "/standard_fonts/LiberationSans-Regular.ttf", baseFont: "LiberationSans", subtype: "TrueType" },
+  { url: "/standard_fonts/NotoSansSC-Regular.otf", baseFont: "NotoSansSC", subtype: "OpenType" },
+];
+
+const cidFontBytesCache = new Map<string, Uint8Array | null>();
+let cidFontkit: unknown | null = null;
+let cidFontSeq = 0;
+
+/** 浏览器版 fontkit（@pdf-lib/fontkit）；加载失败 ⇒ 不承接（保持 PNG） */
+async function loadCidFontkit(): Promise<unknown | null> {
+  if (cidFontkit) return cidFontkit;
+  try {
+    const mod: unknown = await import("@pdf-lib/fontkit");
+    const candidate = (mod as { default?: unknown }).default ?? mod;
+    cidFontkit = candidate ?? null;
+  } catch (e) {
+    console.warn("[ExportRenderer][CID] fontkit 加载失败 ⇒ 保持 PNG fallback", e);
+    cidFontkit = null;
+  }
+  return cidFontkit;
+}
+
+/** 按需加载（含失败缓存，避免每次导出重试） */
+async function loadCidFontBytes(url: string): Promise<Uint8Array | null> {
+  if (cidFontBytesCache.has(url)) return cidFontBytesCache.get(url) ?? null;
+  try {
+    const res = await fetch(url);
+    const bytes = res.ok ? new Uint8Array(await res.arrayBuffer()) : null;
+    cidFontBytesCache.set(url, bytes);
+    return bytes;
+  } catch (e) {
+    console.warn("[ExportRenderer][CID] 字体资产加载失败 ⇒ 保持 PNG fallback", url, e);
+    cidFontBytesCache.set(url, null);
+    return null;
+  }
+}
+
+/**
+ * 尝试用 **CID/Type0 嵌入子集字体**绘制非 WinAnsi 文本（矢量 + 可搜索文本层）。
+ *
+ * Step 5B 形状：
+ *   firstGlyph 的原字体身份
+ *        └─ resolveFont()（既有 resolver）→ embeddedData
+ *              └─ 逐字符 coverage（fontkit.hasGlyphForCodePoint）
+ *                    ├─ covered   → 原字体
+ *                    └─ uncovered → 既有 CID_FALLBACK_FONTS（NotoSansSC 永远保留）
+ *
+ * @returns true ⇒ 已绘制（调用方必须跳过 PNG 栅格化）
+ */
+async function tryDrawNonWinAnsiAsCid(args: {
+  pdf: PDFDocument;
+  page: PDFPage;
+  /** 目标页下标（`resolveFont` 抽取内嵌字体流时用；与 `args.page` 同页） */
+  pageIndex: number;
+  text: string;
+  /** ★ Step 5B：该行原 PDF 字体身份（`glyph.fontIdentity ?? glyph.metrics?.fontIdentity`） */
+  fontIdentity?: GlyphFontIdentity;
+  x: number;
+  y: number;
+  size: number;
+  color: { r: number; g: number; b: number };
+}): Promise<boolean> {
+  if (!args.text) return false;
+  const fontkit = await loadCidFontkit();
+  if (!fontkit) return false;
+
+  // ── Step 5B ①：原 PDF 内嵌字体优先（字节来自既有 resolver，不新建 loader / cache）──
+  //   任何一步失败都只是「该来源不参与候选」，绝不因此抛弃整个导出：
+  //   非 embedded / embeddedData 缺失 / fontkit 解析失败 / 覆盖不足 ⇒ 落到下面兜底表。
+  let originalResolved: ResolvedFont | undefined;
+  if (args.fontIdentity) {
+    try {
+      originalResolved = resolveFont({
+        identity: args.fontIdentity,
+        pdf: args.pdf,
+        pageIndex: args.pageIndex,
+      });
+    } catch (e) {
+      console.warn("[ExportRenderer][CID] 原字体 resolveFont 失败 ⇒ 仅用兜底字体", e);
+      originalResolved = undefined;
+    }
+  }
+  const originalSource = createCidFontSource({
+    label: `original:${originalResolved?.baseFont ?? "unknown"}`,
+    resolved: originalResolved,
+    fontkit,
+  });
+
+
+  // ── Step 5B ②：既有兜底资产（顺序与内容不变：Liberation → NotoSansSC）──
+  const fallbackSources: CidFontSource[] = [];
+  for (const candidate of CID_FALLBACK_FONTS) {
+    const bytes = await loadCidFontBytes(candidate.url);
+    if (!bytes) continue;
+    const source = createCidFontSource({
+      label: `fallback:${candidate.baseFont}`,
+      resolved: {
+        source: "embedded",
+        baseFont: candidate.baseFont,
+        subtype: candidate.subtype,
+        embedded: true,
+        embeddedData: bytes,
+      },
+      fontkit,
+    });
+    if (source) fallbackSources.push(source);
+  }
+
+  const drawArgs = {
+    pdf: args.pdf,
+    page: args.page,
+    text: args.text,
+    x: args.x,
+    y: args.y,
+    size: args.size,
+    color: args.color,
+    fontkit,
+  };
+
+  // ── Step 5B ③：先按「原字体 + 兜底」分段绘制 ──
+  if (originalSource) {
+    if (
+      await drawCidCoverageRuns({ ...drawArgs, sources: [originalSource, ...fallbackSources] })
+    ) {
+      return true;
+    }
+    // 原字体方案整体失败（装配/绘制异常）⇒ 退回纯兜底分段（= Step 5B 之前的行为）
+    if (await drawCidCoverageRuns({ ...drawArgs, sources: fallbackSources })) return true;
+    return false;
+  }
+
+  return drawCidCoverageRuns({ ...drawArgs, sources: fallbackSources });
+}
+
+/**
+ * Step 5B：一个可用于 CID 矢量绘制的字体来源。
+ *
+ * 只有两类来源，**没有第三类**：
+ *   ① `original:…` —— 该行原 PDF 内嵌字体（字节来自既有 `resolveFont` / `extractEmbeddedFont`）
+ *   ② `fallback:…` —— `CID_FALLBACK_FONTS` 资产（Export-only，按需 fetch，行为不变）
+ *
+ * `covers` 是逐字符覆盖判定的唯一实现（内部即 `fontkit.hasGlyphForCodePoint`）。
+ */
+interface CidFontSource {
+  label: string;
+  resolved: ResolvedFont;
+  /** 逐字符覆盖判定；解析失败时该来源直接不进候选（fail-open） */
+  covers: (codePoint: number) => boolean;
+}
+
+/**
+ * 用既有 fontkit 建立覆盖判定。
+ *
+ * ⚠️ **canary 校验是必需的，不是防御性冗余**：`fontkit.create(bytes)` 对某些字体
+ * **不抛异常但返回不可用对象**（真实案例：Type0/Identity-H 的 CID-keyed FontFile2 子集，
+ * 例如 gd-swim-2026.pdf 的 `NREKVL+FangSong_GB2312` —— 之后每次 `hasGlyphForCodePoint`
+ * 都抛 `Cannot read properties of undefined (reading 'tables')`）。
+ * 若不在此处 canary 校验，该来源会被当成合法候选进入优先级列表，而每次覆盖判定都被
+ * `planCidCoverageRuns` 的 try/catch 吞成「不覆盖」⇒ **静默**退化成既有兜底字体，
+ * 表现为「修复没生效」且没有任何线索。
+ *
+ * 解析失败 / 无嵌入字节 / 非 embedded 来源 ⇒ 返回 null（该来源不参与，**绝不抛弃整个导出**）。
+ */
+function createCidFontSource(args: {
+  label: string;
+  resolved: ResolvedFont | undefined;
+  fontkit: unknown;
+}): CidFontSource | null {
+  if (!args.resolved) return null;
+  const bytes = args.resolved.embeddedData;
+  // 只接受真正拿到字节的 embedded 来源（standard14 / system-fallback 无字节可嵌）。
+  if (args.resolved.source !== "embedded" || !bytes || bytes.length === 0) return null;
+  let covers: (cp: number) => boolean;
+  try {
+    const font = (
+      args.fontkit as {
+        create: (b: Uint8Array) => { hasGlyphForCodePoint: (cp: number) => boolean };
+      }
+    ).create(bytes);
+    covers = (cp) => font.hasGlyphForCodePoint(cp);
+  } catch (e) {
+    console.warn(`[ExportRenderer][CID] ${args.label} 字体创建失败 ⇒ 该来源不参与`, e);
+    return null;
+  }
+  // ★ canary：立刻试跑一次覆盖判定，确认这个来源**真的可用**（而不是每次判定时才抛）
+  try {
+    covers(0x41); // "A"
+    covers(0x5e7f); // "广"
+  } catch (e) {
+    console.warn(
+      `[ExportRenderer][CID] ${args.label} 字体无法做覆盖判定（fontkit 解析不完整）⇒ 该来源不参与，落既有兜底`,
+      e
+    );
+    return null;
+  }
+  return { label: args.label, resolved: args.resolved, covers };
+}
+
+/** coverage run：一段连续使用同一来源的文本 */
+interface CidCoverageRun {
+  text: string;
+  source: CidFontSource;
+}
+
+/**
+ * ★ coverage-aware 分段（Step 5B 的核心）。
+ *
+ * 逐字符取「优先级最高且覆盖它」的来源，相邻同来源合并成一个 run：
+ *   `广东省体育局ABC😀`
+ *     → [FangSong] 广东省体育局ABC   （原字体子集覆盖得到）
+ *     → [Noto]     😀                  （原字体子集没有该字形 ⇒ 落兜底）
+ *
+ * ★ 任何一个字符没有任何来源覆盖 ⇒ 返回 null（整行交回 PNG 兜底，**绝不半途丢字**）。
+ * 按码点迭代（`for…of` string），emoji 等增补平面字符不会被拆成孤立 surrogate。
+ */
+function planCidCoverageRuns(
+  text: string,
+  sources: readonly CidFontSource[]
+): CidCoverageRun[] | null {
+  if (sources.length === 0) return null;
+  const runs: CidCoverageRun[] = [];
+  let current: CidCoverageRun | null = null;
+  for (const ch of text) {
+    const codePoint = ch.codePointAt(0)!;
+    let picked: CidFontSource | undefined;
+    for (const source of sources) {
+      let covered = false;
+      try {
+        covered = source.covers(codePoint);
+      } catch {
+        covered = false; // 单个来源判定异常 ⇒ 当作不覆盖，继续问下一个
+      }
+      if (covered) {
+        picked = source;
+        break;
+      }
+    }
+    if (!picked) return null;
+    if (current && current.source === picked) current.text += ch;
+    else {
+      current = { text: ch, source: picked };
+      runs.push(current);
+    }
+  }
+  return runs.length > 0 ? runs : null;
+}
+
+/**
+ * 把 coverage runs 画到页面上。
+ *
+ * 分两阶段（★ 这是回退安全的关键）：
+ *   阶段 1 逐 run 装配字体 —— `assembleCidFont` **不写页面**，所以任一 run 装配失败都可以
+ *           整段放弃并退回兜底方案，不会留下「前半段已画、后半段换字体」的重复文字。
+ *   阶段 2 按 run 顺序绘制，游标从 `args.x` 起按**已绘制文本的真实 advance** 逐段累加 ——
+ *           换字体只影响后续 run 的起点，不会把整段文本重新从 x 画一遍（定位语义不变）。
+ */
+async function drawCidCoverageRuns(args: {
+  pdf: PDFDocument;
+  page: PDFPage;
+  text: string;
+  x: number;
+  y: number;
+  size: number;
+  color: { r: number; g: number; b: number };
+  fontkit: unknown;
+  sources: readonly CidFontSource[];
+}): Promise<boolean> {
+  const runs = planCidCoverageRuns(args.text, args.sources);
+  if (!runs) return false;
+
+  // 阶段 1：装配（不落页面）
+  const staged: Array<{ run: CidCoverageRun; font: PDFFont }> = [];
+  for (const run of runs) {
+    try {
+      const assembled = await assembleCidFont(args.pdf, run.source.resolved, {
+        fontkit: args.fontkit,
+        resourceName: `FCID${++cidFontSeq}`,
+        glyphText: run.text,
+        // ★ 真实导出必须单次 save（005E-B 契约）⇒ noMaterialize=true
+        noMaterialize: true,
+      });
+      staged.push({ run, font: assembled.font });
+    } catch (e) {
+      console.warn(
+        `[ExportRenderer][CID] run 装配失败（source=${run.source.label}）⇒ 交回既有兜底`,
+        e
+      );
+      return false;
+    }
+  }
+
+  // 阶段 2：绘制（游标累加，绝不因换字体回到 x）
+  let cursorX = args.x;
+  for (const { run, font } of staged) {
+    try {
+      args.page.drawText(run.text, {
+        x: cursorX,
+        y: args.y,
+        size: args.size,
+        font,
+        color: rgb(args.color.r, args.color.g, args.color.b),
+        maxWidth: 100000,
+      });
+      cursorX += font.widthOfTextAtSize(run.text, args.size);
+    } catch (e) {
+      console.warn(
+        `[ExportRenderer][CID] run 绘制失败（source=${run.source.label}）`,
+        e
+      );
+      return false;
+    }
+  }
+  return true;
+}
+
+
 function needsUnicodeFallback(text: string): boolean {
   for (const ch of text) {
     const code = ch.codePointAt(0)!;

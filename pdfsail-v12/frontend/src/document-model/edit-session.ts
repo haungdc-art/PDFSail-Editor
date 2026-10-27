@@ -12,6 +12,9 @@
  * 不可变性：EditSession 每次更新返回新对象（readonly 语义，便于 diff/undo 未来接入）。
  */
 import type { SelectionRange } from "./current-selection";
+// F3B-6.22-B2: 复用既有 Word Boundary 语义（坐标桥接见 deleteWordAtCaret）。
+// 不在此文件重新发明 word 分类 / 连接符语义 / 步进原语（那些只在 word-boundary.ts 唯一存在）。
+import { wordRangeAt, type WordDirection } from "../editor/core/input/word-boundary";
 
 /** EditSession 的稳定 target（进入时固定，不可变） */
 export interface EditSessionTarget {
@@ -114,7 +117,8 @@ export function createEditSession(
   // Multi-line 暂不支持：SAFE REJECT（不产生部分编辑）
   if (ranges && ranges.length > 1) return null;
 
-  const len = originalText.length;
+  // F3B-6.22-C: caret 是 code-point 空间 ⇒ 用 codePointLength，不是 originalText.length（UTF-16）。
+  const len = codePointLength(originalText);
   // M7-004B: 可选初始 caret（selection 路径用 selection range 初始化，而非默认末尾）。
   // 向后兼容：未传时保持原默认 caret={len,len}（可被点击位置/后续操作覆盖）。
   const caret = initialCaret
@@ -144,7 +148,8 @@ export function updateSessionText(
   return {
     ...session,
     text: newText,
-    caret: caret ?? clampCaret(session.caret, newText.length),
+    // F3B-6.22-C: clamp 上界是 caret（code-point）空间 ⇒ codePointLength，不是 newText.length。
+    caret: caret ?? clampCaret(session.caret, codePointLength(newText)),
   };
 }
 
@@ -154,7 +159,8 @@ export function updateSessionCaret(
   caret: { start: number; end: number }
 ): EditSession {
   if (session.status !== "active") return session;
-  return { ...session, caret: clampCaret(caret, session.text.length) };
+  // F3B-6.22-C: 同上，clamp 上界用 code-point 长度。
+  return { ...session, caret: clampCaret(caret, codePointLength(session.text)) };
 }
 
 /** Commit：标记 status=committed（实际的 document mutation 由调用方用 Precise Range 执行） */
@@ -197,7 +203,8 @@ export function ensureGlyphCaretFromCaretPosition(session: EditSession): EditSes
   if (session.status !== "active") return session;
   if (session.glyphCaret) return session;
   if (session.caret.start !== session.caret.end) return session;
-  const pos = Math.max(0, Math.min(session.caret.start, session.text.length));
+  // F3B-6.22-C: caret 是 code-point 空间 ⇒ clamp 上界用 codePointLength。
+  const pos = Math.max(0, Math.min(session.caret.start, codePointLength(session.text)));
   const glyphIndex = pos === 0 ? 0 : pos - 1;
   const offset: "before" | "after" = pos === 0 ? "before" : "after";
   return {
@@ -216,9 +223,37 @@ export function ensureGlyphCaretFromCaretPosition(session: EditSession): EditSes
 // 用户用鼠标点击/选择 textarea 时，DOM caret 移动但 session.glyphCaret 不感知 →
 // insertAtGlyph 用旧 glyphCaret 定位 → "在末尾点击后输入，文本插入到中间"。
 
-/** 字符偏移 → UTF-16 offset（session.text 内） */
-function charToUtf16(text: string, charPos: number): number {
+/**
+ * 字符偏移（code point）→ UTF-16 offset（session.text 内）。
+ * F3B-6.22-C: 导出 —— 契约测试直接调用 production 转换，禁止在别处复制第二套转换实现。
+ */
+export function charToUtf16(text: string, charPos: number): number {
   return Array.from(text).slice(0, Math.max(0, Math.min(charPos, Array.from(text).length))).join("").length;
+}
+
+/**
+ * F3B-6.22-B2: UTF-16 offset → code-point offset（session.text 内）。
+ * 与 `charToUtf16` 互为 inverse，但**仅对 code-point 对齐的端点精确**
+ * （wordRangeAt 内部 stepBack/stepForward 保证其返回区间端点落在 code point 边界）。
+ *
+ * F3B-6.22-C: 导出 —— **凡是**把 DOM（UTF-16）偏移写进 session.caret 的地方都必须经此函数，
+ * 不得直接赋值（原 `applyTextareaValue` 即因此产生非 BMP 错位）。
+ */
+export function utf16ToCodePoint(text: string, u16Offset: number): number {
+  const u16 = Math.max(0, Math.min(u16Offset, text.length));
+  if (u16 >= text.length) return Array.from(text).length;
+  return Array.from(text.slice(0, u16)).length;
+}
+
+/**
+ * F3B-6.22-C: session.caret / selectionAnchor / composing 的坐标空间长度（code point 数）。
+ *
+ * **禁止**用 `text.length`（UTF-16 code unit 数）作为 caret 偏移或 clamp 上界：
+ * 非 BMP（emoji / CJK 扩展 B）下两者不等 ⇒ 越界或错位 caret。
+ * （glyphIndex 属 glyph 空间，不受本函数约束 —— glyphCaret 架构本轮冻结。）
+ */
+export function codePointLength(text: string): number {
+  return Array.from(text).length;
 }
 
 /**
@@ -283,7 +318,8 @@ export function domSelectionOffsetsOf(session: EditSession): { start: number; en
 export function startComposition(session: EditSession): EditSession {
   if (session.status !== "active") return session;
   if (session.composing) return session;
-  const len = session.text.length;
+  // F3B-6.22-C: composing.start/end 是 caret（code-point）空间 ⇒ codePointLength。
+  const len = codePointLength(session.text);
   const start = Math.max(0, Math.min(session.caret.start, len));
   const end = Math.max(start, Math.min(session.caret.end, len));
   return {
@@ -362,7 +398,8 @@ export function moveGlyphCaretSelect(session: EditSession, delta: number): EditS
   const gc = session.glyphCaret;
   const focus = caretOffsetOf(session); // 当前 caret 字符偏移
   const anchor = session.selectionAnchor ?? focus; // 首次 Shift 固定锚点
-  const maxIndex = session.text.length;
+  // F3B-6.22-C: newFocus 是 caret（code-point）偏移 ⇒ clamp 上界用 codePointLength。
+  const maxIndex = codePointLength(session.text);
   const newFocus = Math.max(0, Math.min(focus + delta, maxIndex));
   const start = Math.min(anchor, newFocus);
   const end = Math.max(anchor, newFocus);
@@ -401,7 +438,8 @@ export function moveGlyphCaretHome(session: EditSession): EditSession {
  */
 export function moveGlyphCaretEnd(session: EditSession): EditSession {
   if (session.status !== "active" || !session.glyphCaret) return session;
-  const len = session.text.length;
+  // F3B-6.22-C: caret 是 code-point 空间 ⇒ codePointLength（原用 text.length=UTF-16，非 BMP 越界）。
+  const len = codePointLength(session.text);
   return {
     ...session,
     caret: { start: len, end: len },
@@ -438,7 +476,8 @@ export function moveGlyphCaretSelectEnd(session: EditSession): EditSession {
   if (session.status !== "active" || !session.glyphCaret) return session;
   const focus = caretOffsetOf(session);
   const anchor = session.selectionAnchor ?? focus; // 首次 Shift+End 锚定当前位置
-  const len = session.text.length;
+  // F3B-6.22-C: caret 是 code-point 空间 ⇒ codePointLength。
+  const len = codePointLength(session.text);
   return {
     ...session,
     caret: { start: Math.min(anchor, len), end: Math.max(anchor, len) },
@@ -456,7 +495,8 @@ export function moveGlyphCaretSelectEnd(session: EditSession): EditSession {
  */
 export function selectAll(session: EditSession): EditSession {
   if (session.status !== "active" || !session.glyphCaret) return session;
-  const len = session.text.length;
+  // F3B-6.22-C: caret 是 code-point 空间 ⇒ codePointLength（原用 text.length=UTF-16，非 BMP 越界）。
+  const len = codePointLength(session.text);
   return {
     ...session,
     caret: { start: 0, end: len },
@@ -571,7 +611,8 @@ export function deleteAtGlyph(session: EditSession): EditSession {
   const chars = Array.from(session.text);
   if (delPos >= chars.length) return session; // 行尾，无可删
   const newText = chars.slice(0, delPos).join("") + chars.slice(delPos + 1).join("");
-  const newCaretIdx = Math.min(delPos, newText.length);
+  // F3B-6.22-C: newCaretIdx 是 caret（code-point）偏移 ⇒ clamp 上界用 codePointLength。
+  const newCaretIdx = Math.min(delPos, codePointLength(newText));
   return {
     ...session,
     text: newText,
@@ -581,6 +622,53 @@ export function deleteAtGlyph(session: EditSession): EditSession {
       ? { ...gc, glyphIndex: newCaretIdx === 0 ? 0 : newCaretIdx - 1, offset: "after" }
       : undefined,
   };
+}
+
+/**
+ * F3B-6.22-B2: 词删除（EditSession working-draft 域，纯函数；EditSession → EditSession）。
+ *
+ * ★ 不操作 EditableLine.glyphs，不碰 Core Document / Legacy glyph。
+ * ★ 复用既有 Word Boundary 语义（word-boundary.ts 的 wordRangeAt），但通过
+ *   `charToUtf16` / `utf16ToCodePoint` 桥接 session 的 **code-point caret**
+ *   与 wordRangeAt 的 **UTF-16 offset**（两者坐标系统不兼容，必须显式桥接，
+ *   绝不直接 `wordRangeAt(session.text, session.caret.start, ...)`）。
+ *
+ * 行为（对照 Audit §5 Contract R1-R10）：
+ *   - composing / replace-selection 模式 → no-op（R1/R2）
+ *   - non-collapsed caret → 删除当前 selection（复用 deleteSelection，R3）
+ *   - collapsed caret → 按方向取词区间：
+ *       backward：删 caret 左侧词，caret collapse 到区间 start（R5）
+ *       forward ：删 caret 右侧词，caret 保持原字符偏移（R6）
+ *   - 该方向无词（行首 backward / 行尾 forward）→ no-op（wordRangeAt 返回 null，R4）
+ *   - 不跨行/段落（单行 working draft 语义保证，R8）
+ *   - 端点落在 code-point 边界，绝不切 surrogate（wordRangeAt 内部 stepBack/stepForward，R7）
+ *   - 只改 EditSession，不碰 Core Document / Legacy glyph（R9）
+ *
+ * 不引入第二套 word-boundary / 第二套步进 / 第二套坐标 Truth（坐标桥接复用既有 charToUtf16）。
+ */
+export function deleteWordAtCaret(
+  session: EditSession,
+  direction: WordDirection
+): EditSession {
+  if (session.status !== "active") return session;
+  // R1/R2: composition / replace-selection → no-op（交 IME/浏览器，或保持既有 SAFE no-op）
+  if (session.composing) return session;
+  if (session.editingMode === "replace-selection") return session;
+  // R3: 有 selection → 删当前 selection（与 Segment Surface commandsForAction 一致，不发新词区间）
+  if (hasSelection(session)) return deleteSelection(session);
+
+  const chars = Array.from(session.text);
+  const cp = Math.max(0, Math.min(session.caret.start, chars.length));
+  // session caret（code-point） → UTF-16 offset（wordRangeAt 的输入坐标）
+  const u16 = charToUtf16(session.text, cp);
+  const range = wordRangeAt(session.text, u16, direction);
+  if (!range) return session; // R4: 行首 backward / 行尾 forward → no-op（不得猜）
+  // UTF-16 区间 → code-point 区间（端点 code-point 对齐，R7 安全）
+  const cpStart = utf16ToCodePoint(session.text, range.start);
+  const cpEnd = utf16ToCodePoint(session.text, range.end);
+  // 把词区间设为 selection，再复用既有 deleteSelection（统一 lastOp 归属 + glyphCaret 更新）
+  const selected = updateSessionCaret(session, { start: cpStart, end: cpEnd });
+  return deleteSelection(selected);
 }
 
 /**
@@ -649,9 +737,15 @@ export function applyTextareaValue(
   cursorUtf16: number
 ): EditSession {
   if (session.status !== "active") return session;
-  // textarea.selectionStart 是 UTF-16 编码单元；value.length 也是 UTF-16，两者同空间（BMP 常用汉字 1 单元）。
-  const c = Math.max(0, Math.min(cursorUtf16, value.length));
+  // F3B-6.22-C (P0): cursorUtf16 来自 textarea.selectionStart —— **UTF-16** 空间；
+  // 而 session.caret 是 **code-point** 空间。原实现直接赋值，仅当「1 字符 = 1 UTF-16 单元」（BMP）
+  // 时恰好相等；非 BMP（emoji / CJK 扩展 B）会错位：
+  //   例 "😀AB"：caret 在 A 后 ⇒ selectionStart = 3（UTF-16），而正确 code-point 偏移 = 2
+  //   ⇒ 原实现把 caret 写成 3（= B 之后），后续插入/删除定位错误。
+  // 必须经既有 utf16ToCodePoint 转换（内部已 clamp 到 [0, value.length]），不得复制第二套算法。
+  const c = utf16ToCodePoint(value, cursorUtf16);
   const gc = session.glyphCaret;
+  const cpLen = codePointLength(value);
   return {
     ...session,
     text: value,
@@ -663,8 +757,9 @@ export function applyTextareaValue(
     glyphCaret: gc
       ? {
           ...gc,
-          glyphIndex: value.length === 0 ? 0 : Math.max(0, c - 1),
-          offset: value.length === 0 || c === 0 ? "before" : "after",
+          // 空串判定同样走 code-point 长度（glyphIndex 本身属 glyph 空间，本轮冻结不重构）。
+          glyphIndex: cpLen === 0 ? 0 : Math.max(0, c - 1),
+          offset: cpLen === 0 || c === 0 ? "before" : "after",
         }
       : undefined,
   };
