@@ -38,16 +38,41 @@ import { pdfLinesToEditableBlock } from "./pdf-native-adapter";
 import { parsePdfFontMetrics } from "./pdf-font-metrics";
 import { buildFontProvenanceMap } from "./pdf-font-provenance";
 import { resolvePageShowTextWithXObjects } from "./content-stream-resolver";
+import { computeOperatorProvenance, type GlyphProvenance, type GlyphProvenanceInput } from "../editor/binding/operator-provenance";
 import { createPage } from "./dom/page-builder";
 import { domPageToEditablePage } from "./dom/editable-page-compat";
 import { extractImageRegions, extractTextItemRects, classifyLineRenderSources } from "./render-source-detector";
 import type { ImageOpCodes } from "./render-source-detector";
 
-// Node 环境：指定内置 worker 源，主线程 fake worker 解析（避免 DataCloneError）。
-GlobalWorkerOptions.workerSrc = new URL(
-  "../../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs",
-  import.meta.url,
-).href;
+// Node 环境默认：指定内置 worker 源，主线程 fake worker 解析（避免 DataCloneError）。
+//
+// ⚠️ 这条路径是 `node_modules` 相对 URL，**只在 Node 下成立**。
+// 浏览器/扩展等打包消费者不会托管 node_modules ⇒ 必须用下面的 setter
+// 显式注入自己的 worker 资源 URL（Vite 用 `?url` 资源导入，如 src/pdfjs-worker-src.ts）。
+let workerSrcOverride: string | null = null;
+
+function defaultWorkerSrc(): string {
+  return new URL(
+    "../../../node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs",
+    import.meta.url,
+  ).href;
+}
+
+/**
+ * 覆盖 importer 使用的 pdf.js worker 源。
+ * 打包环境（浏览器 / Chrome 扩展 / 其它 Vite 应用）在调用 parsePdfToEditableDocument 之前调用它。
+ */
+export function setPdfImporterWorkerSrc(url: string): void {
+  workerSrcOverride = url;
+  GlobalWorkerOptions.workerSrc = url;
+}
+
+/** 当前生效的 worker 源（诊断用） */
+export function getPdfImporterWorkerSrc(): string {
+  return workerSrcOverride ?? defaultWorkerSrc();
+}
+
+GlobalWorkerOptions.workerSrc = getPdfImporterWorkerSrc();
 
 // 标准 14 字体的 AFM 数据目录（消除 standardFontDataUrl 警告，正确解析标准字体）。
 const STANDARD_FONT_DATA_URL = new URL(
@@ -91,10 +116,8 @@ export async function parsePdfToEditableDocument(
   let pdfLibDoc: PDFDocument | undefined;
   try {
     pdfLibDoc = await PDFDocument.load(new Uint8Array(bytes), { ignoreEncryption: true, throwOnInvalidObject: false });
-    if (process.env.MASK_DIAG === "1") console.error(`[DBG] pdf-lib loaded, bytes.byteLength=${(bytes as any).byteLength}, pages=${pdfLibDoc.getPageCount()}`);
     pageFontMetrics = parsePdfFontMetrics(pdfLibDoc);
-  } catch (e) {
-    if (process.env.MASK_DIAG === "1") console.error(`[DBG] pdf-lib load/metrics threw:`, (e as Error)?.message);
+  } catch {
     pageFontMetrics = undefined;
     pdfLibDoc = undefined;
   }
@@ -241,167 +264,72 @@ export async function parsePdfToEditableDocument(
  *       · 算子无 /ToUnicode（unicodeText 缺失，无法做文本身份锚定）
  *       · 整页命中率 < 50%（编码/对齐整体不可信，fail-closed 整页放弃）
  */
+
+
+/**
+ * F3B-6.17-3C-6B1.1-P1-C · Legacy adapter = compute → apply。
+ *
+ * 「计算」全部委托给纯函数 `computeOperatorProvenance`（唯一 provenance 计算入口，
+ * 见 `editor/binding/operator-provenance.ts`）；本函数只负责把结果**写回** legacy glyph，
+ * 不再持有任何匹配算法。行为与原 inline 算法等价：
+ *   · resolvePageShowTextWithXObjects 抛错 → 整页 UNKNOWN（清空 operatorId，fail-closed）
+ *   · coverage < 0.5 → 整页 UNKNOWN（清空 operatorId）
+ *   · 否则逐 glyph 写回 matched operatorId / operatorCharIndex
+ */
 async function assignOperatorProvenance(
   doc: EditableDocument,
   pdfLibDoc: PDFDocument | undefined,
 ): Promise<void> {
-  if (!pdfLibDoc) { if (process.env.MASK_DIAG === "1") console.error("[FIX-002-DBG] pdfLibDoc undefined → provenance skipped"); return; }
+  if (!pdfLibDoc) return;
   for (let p = 0; p < doc.pages.length; p++) {
-    await assignOperatorProvenanceForPage(doc.pages[p], pdfLibDoc, p);
-  }
-}
-
-/**
- * M7.8-042-FIX · 页级 Original Operator Provenance 建立（导出给应用内联构建路径使用）。
- *
- * 背景：应用（PDFEditor.tsx）不经过 parsePdfToEditableDocument，而是 pdfjs getTextContent →
- * pdfLinesToEditableBlock 内联构建 EditableDocument —— 此前该路径从不建立 glyph.operatorId，
- * 导致导出期 stripReplacedTextOperators 收集不到原算子，只能靠文本兜底剥离；
- * 兜底对「非连续算子行」（表格行文字在内容流中与其它行交错）必然失配（idx=-1）→
- * 原文残留 + 新文字叠加 = 重影。
- *
- * @param page 新构建的页（blocks 含 glyph；可为独立对象，函数只改 glyph 字段）
- * @param pdfLibDoc pdf-lib 文档（提供内容流 / ToUnicode 解码）
- * @param pdfLibPageIndex 0-based pdf-lib 页索引（pdf.js 1-based 页码 - 1）
- */
-export async function assignOperatorProvenanceForPage(
-  page: Pick<EditablePage, "blocks">,
-  pdfLibDoc: PDFDocument | undefined,
-  pdfLibPageIndex: number,
-): Promise<void> {
-  if (!pdfLibDoc) { if (process.env.MASK_DIAG === "1") console.error("[FIX-002-DBG] pdfLibDoc undefined → provenance skipped"); return; }
-  const p = pdfLibPageIndex;
-  let records: ReturnType<typeof resolvePageShowTextWithXObjects>;
-  try {
-    records = resolvePageShowTextWithXObjects(pdfLibDoc, p);
-  } catch (e) {
-    if (process.env.MASK_DIAG === "1") console.error(`[FIX-002-DBG] page ${p} resolve threw:`, (e as Error).message);
-    return;
-  }
-  // 收集本页 glyph（文档顺序：block → line → glyph），每个 glyph 单一字符。
-  const glyphs: EditableGlyph[] = [];
-  for (const block of page.blocks) {
-    for (const line of block.lines) {
-      for (const g of line.glyphs) glyphs.push(g);
-    }
-  }
-  if (glyphs.length === 0) { if (process.env.MASK_DIAG === "1") console.error(`[FIX-002-DBG] page ${p} has 0 doc glyphs (records=${records.length})`); return; }
-
-  // M7.8-036-FIX-002 · 内容身份对齐（content-identity alignment）。
-  // doc glyph 顺序（按 Y 排序的 block/line）≠ content stream 物理顺序，
-  // 因此**不能**用顺序对齐——顺序对齐会在任意顺序发散点整体失配，导致整页 provenance 被
-  // fail-closed 清空（见诊断 _diag_ytrace_11：char 36 处 "TÍTULOSRef." vs "TÍTULOSSoli" 即发散）。
-  //
-  // 改为：对每个 showText 算子取其 unicodeText（由 /ToUnicode 解出的真实文本，整段锚点），
-  // 在 glyph 长文本中按**文本内容**匹配（indexOf）定位该算子对应的 glyph 区间，把 operatorId 钉死过去。
-  // 导出时 stripReplacedTextOperators 只消费 operatorId（整 operator 剥离），不依赖任何字符级顺序。
-  //
-  // M7.8-042-ALIGN-BAND（关键修正）：纯文本全页匹配对「重复文本」是歧义的 —— 表格 PDF 每行都有
-  // "power"/"100%"/"passes"，第 N 行的算子会匹配到第 M 行的 glyph 区间 → 编辑行 strip 时
-  // 误删**其它行**的算子（未编辑行文字缺损 "48 mm/min"/"ass s"），而真正该删的算子残留成重影。
-  // 现按 **baseline 带**约束匹配：resolver 为每个算子记录 textY（原始用户空间 baseline），
-  // glyph 的 metrics.pdfTransform[5] 是 pdf.js 视口 baseline，两者满足 textY ≈ cropTopY - pdfjsY。
-  // 算子只允许匹配**同 baseline 带**内的 glyph（带内歧义无害 —— 同一行的重复词怎么配，
-  // strip 都只删本行算子、整行重绘）；无 textY 的算子（畸形流）退回全页匹配（仅认领未占用区间）。
-  //
-  // 安全闭环不变：命中即正确（逐字精确 + 不与已占用区间重叠）；失败模式 = 不建 provenance
-  // （fail-safe，宁可保留原文重影也不误删）。
-  let cropTopY: number | undefined;
-  try {
-    const pg = pdfLibDoc.getPage(p);
-    const cb = typeof pg.getCropBox === "function" ? pg.getCropBox() : undefined;
-    cropTopY = cb && cb.height > 0 ? cb.y + cb.height : pg.getHeight();
-  } catch {
-    cropTopY = undefined;
-  }
-  const BAND_TOL = 2.5; // pt；行内 baseline 抖动容忍（远小于最小行距）
-
-  // glyph 按 pdf.js baseline 分带（无位置数据的 glyph 不属于任何带 → 不会被带内算子认领）
-  const bandReps: number[] = []; // 每带的代表 pdfjsY
-  const bandGlyphIdx: number[][] = [];
-  for (let i = 0; i < glyphs.length; i++) {
-    const gy = (glyphs[i] as unknown as { metrics?: { pdfTransform?: number[] } }).metrics?.pdfTransform?.[5];
-    if (typeof gy !== "number" || !Number.isFinite(gy)) continue;
-    let b = bandReps.findIndex((y) => Math.abs(y - gy) <= BAND_TOL);
-    if (b < 0) {
-      bandReps.push(gy);
-      bandGlyphIdx.push([]);
-      b = bandReps.length - 1;
-    }
-    bandGlyphIdx[b].push(i);
-  }
-
-  const claimed = new Array<boolean>(glyphs.length).fill(false);
-  let matchedGlyphs = 0;
-
-  /** 在 glyph 索引区间（band 内或全页）里按文本匹配并认领 */
-  const claimIn = (idxs: number[], U: string, r: { operatorId: string }): boolean => {
-    const G = idxs.map((i) => glyphs[i].char ?? "").join("");
-    let j = G.indexOf(U, 0);
-    while (j >= 0) {
-      const end = j + U.length;
-      let overlap = false;
-      for (let k = j; k < end; k++) {
-        if (claimed[idxs[k]]) { overlap = true; break; }
+    const page = doc.pages[p];
+    // 收集本页 glyph（文档顺序：block → line → glyph），每个 glyph 单一字符。
+    const glyphs: EditableGlyph[] = [];
+    for (const block of page.blocks) {
+      for (const line of block.lines) {
+        for (const g of line.glyphs) glyphs.push(g);
       }
-      if (!overlap) {
-        for (let k = j; k < end; k++) {
-          glyphs[idxs[k]].operatorId = r.operatorId;
-          glyphs[idxs[k]].operatorCharIndex = k - j;
-          claimed[idxs[k]] = true;
-        }
-        return true;
-      }
-      j = G.indexOf(U, j + 1);
     }
-    return false;
-  };
+    if (glyphs.length === 0) continue;
 
-  // 长文本优先匹配，避免短词（如 "de"）被更长算子文本（如 "devedocument..."）抢注后长串失配。
-  const ops = records
-    .filter((r) => r.charCodes !== null && !!r.unicodeText && r.unicodeText.length > 0)
-    .sort((a, b) => b.unicodeText!.length - a.unicodeText!.length);
+    // 扁平行输入（仅提供算法所需的 char + pdfTransform，不暴露整个 glyph 对象）。
+    const pageGlyphs: GlyphProvenanceInput[] = glyphs.map((g) => ({
+      char: g.char,
+      pdfTransform: g.metrics?.pdfTransform,
+    }));
 
-  for (const r of ops) {
-    const U = r.unicodeText!;
-    // 算子的 pdf.js 视口 baseline（textY 原始用户空间 → 视口向下坐标）
-    const oy =
-      typeof r.textY === "number" && Number.isFinite(r.textY) && cropTopY !== undefined
-        ? cropTopY - r.textY
-        : undefined;
-    if (oy !== undefined) {
-      // 带内匹配：只允许认领同 baseline 带的 glyph；带内失配 → 不建 provenance（绝不跨行乱认领）。
-      let b = bandReps.findIndex((y) => Math.abs(y - oy) <= BAND_TOL);
-      if (b < 0) continue; // 该算子的行在 doc 中无对应 glyph 带（pdf.js 丢弃）→ fail-safe 跳过
-      if (claimIn(bandGlyphIdx[b], U, r)) matchedGlyphs += U.length;
-    } else {
-      // 无位置数据（畸形流）：退回全页匹配（M7.8-036 原行为，仅认领未占用区间）。
-      const all = glyphs.map((_, i) => i);
-      if (claimIn(all, U, r)) matchedGlyphs += U.length;
+    let provenance: GlyphProvenance[] | null;
+    try {
+      provenance = computeOperatorProvenance(pdfLibDoc, p, pageGlyphs);
+    } catch (error) {
+      // F3B-6.17-3C-6B1.1-P1-A：resolvePageShowTextWithXObjects 抛错 → fail-closed（整页 UNKNOWN）。
+      // 异常不再静默吞掉：provenance 置 null ⇒ 下方整页清空 operatorId，导出时绝不删除原文。
+      provenance = null;
     }
-    // 未命中：该算子不建 provenance（fail-safe，见上方注释）。
-  }
 
-    // fail-closed：若整体命中率极低（编码/对齐整体不可信），整页放弃 provenance，
-    // 宁可全部保留原文也不在可疑位置删除。
-    const coverage = glyphs.length ? matchedGlyphs / glyphs.length : 0;
-    if (coverage < 0.5) {
+    if (provenance === null) {
+      // fail-closed：整页 UNKNOWN（resolve 抛错或 coverage < 0.5）→ 清空，导出时绝不删除原文。
       for (const g of glyphs) {
         g.operatorId = undefined;
         g.operatorCharIndex = undefined;
       }
+      continue;
+    }
+
+    for (let k = 0; k < glyphs.length; k++) {
+      const pv = provenance[k];
+      glyphs[k].operatorId = pv?.operatorId;
+      glyphs[k].operatorCharIndex = pv?.operatorCharIndex;
     }
     if (process.env.MASK_DIAG === "1") {
+      const matched = provenance.filter((pv) => pv.operatorId !== undefined).length;
+      const coverage = matched / glyphs.length;
       console.log(
-        `[FIX-002] 页 ${p} provenance: ${matchedGlyphs}/${glyphs.length} glyphs, ` +
-          `${ops.length} 候选算子, coverage=${(coverage * 100).toFixed(1)}%`,
+        `[FIX-002] 页 ${p} provenance: ${matched}/${glyphs.length} glyphs, ` +
+          `coverage=${(coverage * 100).toFixed(1)}%`,
       );
-      if (ops.length === 0) {
-        const withCodes = records.filter((r) => r.charCodes !== null).length;
-        const withUni = records.filter((r) => !!r.unicodeText).length;
-        console.error(`[FIX-002-DBG] page ${p}: records=${records.length} withCodes=${withCodes} withUni=${withUni}`);
-      }
     }
+  }
 }
 
 /** EditableGlyph 类型（供 assignOperatorProvenance 内部使用） */

@@ -2,6 +2,7 @@
 // 只读/接入逻辑集中在此文件；不修改 EditableTextNode / SegmentBuilder / CoordinateMapper。
 import * as pdfjsLib from "pdfjs-dist";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import { PDFJS_WORKER_SRC_UNCOMPRESSED } from "../pdfjs-worker-src";
 
 export interface FontDataResult {
   fontId: string;
@@ -60,11 +61,7 @@ export async function ensurePdfFontFace(
 export async function openPatchedDoc(appDoc: PDFDocumentProxy): Promise<PDFDocumentProxy> {
   const bytes = await appDoc.getData();
   const savedWorkerSrc = pdfjsLib.GlobalWorkerOptions.workerSrc;
-  const patchedWorkerSrc =
-    new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString() +
-    "?m78=" +
-    Date.now();
-  pdfjsLib.GlobalWorkerOptions.workerSrc = patchedWorkerSrc;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC_UNCOMPRESSED;
   let patchedDoc: any;
   try {
     patchedDoc = await pdfjsLib.getDocument({ data: bytes }).promise;

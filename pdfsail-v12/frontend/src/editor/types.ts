@@ -44,6 +44,13 @@ export type TextBlock = BaseBlock & {
   color?: string;
   /** OCR 替换模式：原文段落 bbox，用于白色遮盖（source layer） */
   originalBounds?: OriginalBounds;
+  /**
+   * 投影文本块（来自 Core 文档 / OCR 投影）携带的来源标记。
+   * 运行期由 renderToBlocks（source = TextBoxObject.source）或 OCR 投影（source.kind === "ocr"）写入；
+   * 供投影渲染层判定（如 OCR 文本禁止浏览器重排版，保持 OCR 已定位的视觉语义）。
+   * 用户创作文本 / 无标记创作块无此字段。
+   */
+  source?: { kind?: string; blockId?: string };
 };
 export type ImageBlock = BaseBlock & { type: "image"; src: string };
 export type SignatureBlock = BaseBlock & { type: "signature"; dataUrl: string };

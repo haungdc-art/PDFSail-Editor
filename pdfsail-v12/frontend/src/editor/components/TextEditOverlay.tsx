@@ -116,6 +116,8 @@ export function TextEditOverlay({
   const sessionOpenedAtRef = useRef<number>(Date.now());
   // M7.7-005: textarea 上最近一次点击（时间 + 位置）→ 识别「session 已打开后的连续两次点击」双击。
   const lastClickRef = useRef<{ t: number; x: number; y: number } | null>(null);
+  // F3B-6.22-C: 鼠标按下是否发生在本 textarea 内（拖选出界兜底的判定依据）。
+  const dragStartRef = useRef(false);
   useEffect(() => {
     const prev = sessionRef.current;
     sessionRef.current = session;
@@ -124,7 +126,23 @@ export function TextEditOverlay({
     // 仅当输入面失焦时补位（正常输入中 activeElement 已是 textarea → no-op；不干扰 IME/工具栏点击）。
     if (prev !== session) {
       // M7.7-005: 记录本 session epoch 打开时刻（双击检测基准）。
-      sessionOpenedAtRef.current = Date.now();
+      //
+      // ★ BugFix（真实 Chromium 复现）：**只在真正换 epoch 时才刷新该时刻**。
+      //   此前条件是 `prev !== session`（对象身份变化）。但 caret 同步
+      //   （syncCaretFromDomSelection）与逐键输入每次都返回**新 session 对象**
+      //   ⇒ 用户连续快速点击时 `sessionOpenedAtRef` 被无限刷新
+      //   ⇒ 之后每次点击都满足 `now - openedAt <= 500` 被**误判为双击**
+      //   ⇒ 触发 wordRangeAt 选词，且词锚取自**陈旧 session.caret** 而非点击位置
+      //   ⇒ 表现为「光标落点与所选文本不一致」+「点击卡死、无法移动到指定位置」。
+      //   epoch 判据 = 换了 target 行，或上一个 session 已非 active（关闭后重开同一行）。
+      const sameTarget =
+        !!prev &&
+        prev.target?.blockId === session.target?.blockId &&
+        prev.target?.lineId === session.target?.lineId;
+      const isNewEpoch = !sameTarget || prev?.status !== "active";
+      if (isNewEpoch) {
+        sessionOpenedAtRef.current = Date.now();
+      }
       const ta = textareaRef.current;
       if (ta && document.activeElement !== ta) ta.focus();
       // M7.7-003A: 打开编辑时 caret 必须保留在 session.caret（Adobe 行为）。
@@ -234,7 +252,15 @@ export function TextEditOverlay({
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === "Enter" && !e.shiftKey) {
+      // F3B-6.22-D-Impl（R2）：composition active 期间**不得**把 Enter 当 commit。
+      //   D-0 实测（真实 Chromium + CDP）：组合中 Enter 的 keydown **会**到达本 handler 且
+      //   `isComposing === true`；若仍 preventDefault + handleSave()，会把**组合预览文本**
+      //   （如拼音 "niD"）当成最终文本提交，且提前结束组合。
+      //   ⇒ 组合期间让位：不 preventDefault、不 commit，交 IME/浏览器完成组合，
+      //     最终仍由 `native input → applyTextareaValue（working draft）→ B1 commit` 收敛。
+      //   ⚠️ 判据只用浏览器已提供的 `nativeEvent.isComposing`；
+      //      **不引入** `EditSession.composing`（D-0 已证明它是死字段）/ 不建 CompositionTracker。
+      if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
         e.preventDefault();
         handleSave();
         return;
@@ -331,6 +357,42 @@ export function TextEditOverlay({
   // 因两次点击 target 不同，浏览器不会派发 dblclick 事件（无法用 onDoubleClick）。
   // 此处用「距 session 打开 < 500ms」或「textarea 上两次快速点击（<500ms 且位移 <8px）」识别双击，
   // 在点击同步的同时把 DOM selection 扩展为点击位置所在的词，再同步到 session caret（选中词）。
+  /**
+   * F3B-6.22-C: 延迟同步「DOM selection → session caret」的**唯一**执行体。
+   * 两个调用方共用它，避免出现第二套同步逻辑：
+   *   - handleCaretSyncDeferred（点击；可能带 forceEnd / 双击选词）
+   *   - document mouseup 兜底（拖选在 textarea 外松开；forceEnd=-1、isDouble=false）
+   * 一律经 sessionRef.current 读取**最新** session（避免陈旧闭包覆盖）。
+   */
+  const runDeferredSync = useCallback((forceEnd: number, isDouble: boolean) => {
+    window.setTimeout(() => {
+      const ta2 = textareaRef.current;
+      if (!ta2 || !onCaretChange) return;
+      const latest = sessionRef.current;
+      if (!latest || latest.status !== "active") return;
+      let domStart = forceEnd >= 0 ? forceEnd : ta2.selectionStart;
+      let domEnd = forceEnd >= 0 ? forceEnd : ta2.selectionEnd;
+      // M7.7-005: 双击 → 扩展为点击位置所在的词（浏览器原生 dblclick 不触发，手动补选词）。
+      //
+      // ★ BugFix：词锚必须取**本次点击的真实落点**（此刻 ta2.selectionStart/End 已是浏览器
+      //   更新后的值），**不得**取 session 的陈旧 caret。
+      //   此前用 domSelectionOffsetsOf(latest)（= 上一次同步后的 caret）作锚
+      //   ⇒ 选中的词与点击位置无关；且一旦落在空白/末尾（wordRangeAt 返回空区间），
+      //     旧的非折叠选区会被原样保留 ⇒ caret 永久卡死（用户报告 bug#1/#2）。
+      if (isDouble) {
+        const anchor = domEnd > domStart ? domEnd : domStart;
+        const wr = wordRangeAt(latest.text, anchor);
+        if (wr.end > wr.start) {
+          ta2.setSelectionRange(wr.start, wr.end);
+          domStart = wr.start;
+          domEnd = wr.end;
+        }
+      }
+      const newSession = syncCaretFromDomSelection(latest, domStart, domEnd);
+      if (newSession !== latest) onCaretChange(newSession);
+    }, 0);
+  }, [onCaretChange]);
+
   const handleCaretSyncDeferred = useCallback((e?: React.MouseEvent<HTMLTextAreaElement>) => {
     const ta = textareaRef.current;
     if (!ta || !onCaretChange) return;
@@ -357,32 +419,32 @@ export function TextEditOverlay({
       const contentRight = ta.scrollLeft + ta.clientWidth;
       if (localXLayout >= contentRight - 10) forceEnd = ta.value.length;
     }
-    window.setTimeout(() => {
-      const ta2 = textareaRef.current;
-      if (!ta2) return;
-      const latest = sessionRef.current;
-      if (!latest || latest.status !== "active") return;
-      let domStart = forceEnd >= 0 ? forceEnd : ta2.selectionStart;
-      let domEnd = forceEnd >= 0 ? forceEnd : ta2.selectionEnd;
-      // M7.7-005: 双击 → 扩展为点击位置所在的词（浏览器原生 dblclick 不触发，手动补选词）。
-      // 参考位置 = session.caret.start（单击 1 命中 glyph 时由 glyphCaretFromClick 写入，码点偏移，
-      //   正确落在被点字符上），**不是** textarea 的 selectionStart（textarea 重新排列整行，
-      //   DOM 点击位置会漂移，双击 "JENNIFER" 可能落回首词 "Atesto"）。
-      // 经 domSelectionOffsetsOf 转成 UTF-16 偏移再做纯文本词扩展（session.text = 文档整行）。
-      if (isDouble) {
-        const { start: cpStart, end: cpEnd } = domSelectionOffsetsOf(latest);
-        const refPos = cpEnd > cpStart ? cpEnd : cpStart; // 用 selection 末端作为词锚（双击选区边缘）
-        const wr = wordRangeAt(latest.text, refPos);
-        if (wr.end > wr.start) {
-          ta2.setSelectionRange(wr.start, wr.end);
-          domStart = wr.start;
-          domEnd = wr.end;
-        }
-      }
-      const newSession = syncCaretFromDomSelection(latest, domStart, domEnd);
-      if (newSession !== latest) onCaretChange(newSession);
-    }, 0);
-  }, [onCaretChange]);
+    // F3B-6.22-C: 复用唯一同步执行体（不再内联第二份 setTimeout 同步逻辑）。
+    runDeferredSync(forceEnd, isDouble);
+  }, [onCaretChange, runDeferredSync]);
+
+  // F3B-6.22-C: 拖选在 textarea **外**松开的最小兜底（DOM selection 最终落地时补一次同步）。
+  //
+  // 缺口：mouse drag → 在 textarea 外 mouseup ⇒ 不触发 textarea 的 click ⇒ 既有 onClick
+  // 同步不执行 ⇒ DOM 已有选区、session.caret 仍是旧值 ⇒ 下一次编辑会用到 stale caret。
+  //
+  // 严格约束（遵守既有边界）：
+  //   - **不引入 selectionchange / onSelect 监听**（历史上它们会带陈旧 session 异步覆盖正确 session）；
+  //   - 仅在「按下发生在 textarea 内」且「松开不在 textarea 上」时补同步；
+  //     松开仍在 textarea 上 ⇒ 交给既有 onClick 路径（保留 forceEnd / 双击选词语义）；
+  //   - 复用 runDeferredSync（唯一同步执行体），不新建第二套同步逻辑/Selection Contract。
+  useEffect(() => {
+    const onDocMouseUp = (ev: MouseEvent) => {
+      if (!dragStartRef.current) return;
+      dragStartRef.current = false;
+      const ta = textareaRef.current;
+      if (!ta) return;
+      if (ev.target === ta) return; // 松开仍在 textarea 上 → onClick 已覆盖
+      runDeferredSync(-1, false);
+    };
+    document.addEventListener("mouseup", onDocMouseUp);
+    return () => document.removeEventListener("mouseup", onDocMouseUp);
+  }, [runDeferredSync]);
 
   return (
     <div
@@ -427,6 +489,10 @@ export function TextEditOverlay({
         // M7.7-004 (Bug2): 点击 → 延迟同步 DOM caret（浏览器 click 后才更新 selection；不用 onSelect，
         // 避免 mount 全选的异步 onSelect 用陈旧 session 覆盖正确 session）
         onClick={handleCaretSyncDeferred}
+        // F3B-6.22-C: 记录按下起点（拖选出界兜底：mouseup 在 textarea 外时补一次同步）。
+        onMouseDown={() => {
+          dragStartRef.current = true;
+        }}
         aria-label="PDF 内联文本编辑"
         spellCheck={false}
         autoComplete="off"

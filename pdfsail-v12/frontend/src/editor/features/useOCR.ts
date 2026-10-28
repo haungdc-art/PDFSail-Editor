@@ -13,8 +13,10 @@
 
 import { useEditor } from "../core/EditorProvider";
 import type { RefObject } from "react";
+import { captureDocBlocksWriteGuard, guardedDocBlocksUpdate } from "../binding/docBlocksWriteGuard";
 import Tesseract from "tesseract.js";
 import type { TextBlock } from "../types";
+import type { OcrImportRawBlock } from "../binding/ocr-import-draft";
 
 // ── 模块级纯工具函数 ──
 
@@ -79,6 +81,55 @@ async function runInlineOCR(image: string, page: number, cssScale: number, psm?:
   });
 }
 
+/**
+ * runInlineOCRWords — Step 2a.5 边界：返回 **word-level** 原始 OCR（`OcrImportRawBlock[]`），
+ * 保留 confidence，不做行级分组，page 原样透传（1-based，见 useDocument.ts:33）。
+ *
+ * 与 `runInlineOCR`（行级分组、丢弃 confidence）平行。本函数供 canonical normalization
+ * （`binding/ocr-import-draft.ts`）在 Step 2b 接入前获得词级原始数据。当前 W3/W4 生产路径
+ * 仍走 `runInlineOCR`（UI / 导出 / Core 语义不变）；本函数仅为归一化接入预留真实边界，
+ * 不改动既有行为、不触碰 Command / EditorDocument / History / Export。
+ */
+async function runInlineOCRWords(
+  image: string,
+  page: number,
+  cssScale: number,
+  psm?: number
+): Promise<OcrImportRawBlock[]> {
+  const scale = 2;
+  const img = await upscaleImageNN(image, scale);
+  const res = await Tesseract.recognize(img, "chi_sim+eng", {
+    logger: () => {},
+    ...(psm ? { tessedit_pageseg_mode: String(psm) } : {}),
+  });
+
+  const words = (res.data.words as any[])
+    .filter((w) => w.text?.trim())
+    .filter((w) => (w.confidence ?? 0) > 35)
+    .filter((w) => {
+      const wW = w.bbox.x1 - w.bbox.x0;
+      const wH = w.bbox.y1 - w.bbox.y0;
+      const ratio = Math.max(wW, wH) / Math.max(Math.min(wW, wH), 1);
+      return wW > 3 && wH > 3 && ratio < 15;
+    });
+
+  return words.map((w) => {
+    const wW = w.bbox.x1 - w.bbox.x0;
+    const wH = w.bbox.y1 - w.bbox.y0;
+    const fontSize = Math.max((wH / scale) * 0.85 * cssScale, 8);
+    return {
+      text: w.text,
+      x: (w.bbox.x0 / scale) * cssScale,
+      y: (w.bbox.y0 / scale) * cssScale,
+      w: (wW / scale) * cssScale,
+      h: (wH / scale) * cssScale,
+      fontSize,
+      page,
+      confidence: w.confidence,
+    } as OcrImportRawBlock;
+  });
+}
+
 function mergeTextRects(items: { x: number; y: number; w: number; h: number }[], yThresh = 12, xGap = 20) {
   if (!items.length) return [];
   const sorted = [...items].sort((a, b) => {
@@ -127,9 +178,25 @@ async function upscaleImageNN(dataUrl: string, scale: number): Promise<string> {
 interface UseOCRParams {
   canvasRef: RefObject<HTMLCanvasElement>;
   cssScaleRef: React.MutableRefObject<number>;
+  /**
+   * STEP-2c-C1：OCR raw `TextBlock[]` 产出后回调（PDFEditor 经此把 OCR 写入 Core）。
+   *
+   * 返回值语义（决定旧 `setBlocks` 是否回落）：
+   *   · `true`  = Core 已认领并提交成功 ⇒ 调用方**不得**再走旧 `setBlocks`
+   *               （否则 docBlocks 会同时存在旧随机 uuid 块与新 `ocr_<hash>` 投影 = duplicate）。
+   *   · `false` / 未传 = Core 不可用（coreDocumentRef 为 null / session 不可建）或归一化为空
+   *               ⇒ 调用方回落旧 `setBlocks`，OCR 不丢失。
+   *
+   * ★ Step 2c-C2-B：该 boolean 就是 **OCR 的 semantic ownership 契约** ——
+   *   `true` ⇒ OCR 只走 Core（Core Command → Core History → Core Projection → Core Export），
+   *           **禁止**再写 Legacy setBlocks（否则出现第二套 OCR identity / 第二次 semantic mutation）。
+   *   `false` ⇒ Legacy fallback 继续存在（fail-closed，OCR 不丢失）。
+   *   即：C2-B 删除的是「Core 已认领后的 Legacy bypass」，**不是**删除 fallback 本身。
+   */
+  onOcrResult?: (blocks: TextBlock[]) => boolean;
 }
 
-export function useOCR({ canvasRef, cssScaleRef }: UseOCRParams) {
+export function useOCR({ canvasRef, cssScaleRef, onOcrResult }: UseOCRParams) {
   const { page, textItems, setBlocks, ocrBusy, setOcrBusy } = useEditor();
 
   const handleOCR = async () => {
@@ -187,7 +254,16 @@ export function useOCR({ canvasRef, cssScaleRef }: UseOCRParams) {
         }));
       }
 
-      setBlocks((prev) => [...prev, ...filtered]);
+      // STEP-2c-C1：优先经生产 seam 写入 Core。
+      // 仅当 Core 未认领（不可用 / 归一化为空 / commit 失败）时才回落旧 setBlocks —— 保证不产生 duplicate。
+      const committedToCore = onOcrResult?.(filtered) === true;
+      if (!committedToCore) {
+        // B2-3：OCR owner = Core/W3 ⇒ Legacy OCR writer disabled（互斥）。
+        // 同时携带 generation：若 OCR 异步期间发生 re-import / Page Op（世代已变），
+        // 旧世代的 Legacy 直写被拒绝，由新世代重新派生，避免「看起来正常、内部已分叉」。
+        const guard = captureDocBlocksWriteGuard();
+        setBlocks((prev) => guardedDocBlocksUpdate(guard, prev, (p) => [...p, ...filtered]));
+      }
     } catch (err) { console.error(err); }
     setOcrBusy(false);
   };
@@ -210,7 +286,13 @@ export function useOCR({ canvasRef, cssScaleRef }: UseOCRParams) {
       const blocks = await runInlineOCR(regionDataUrl, page, s, 6); // PSM 6: single text block
       // Translate OCR coords (relative to region) → page CSS coords
       blocks.forEach((b) => { b.x += x; b.y += y; });
-      setBlocks((prev) => [...prev, ...blocks]);
+      // STEP-2c-C1：优先经生产 seam 写入 Core（与 W3 同契约，未认领才回落旧 setBlocks）。
+      const committedToCore = onOcrResult?.(blocks) === true;
+      if (!committedToCore) {
+        // B2-3：同上 —— OCR owner 互斥 + generation 守卫。
+        const guard = captureDocBlocksWriteGuard();
+        setBlocks((prev) => guardedDocBlocksUpdate(guard, prev, (p) => [...p, ...blocks]));
+      }
     } catch (err) { console.error(err); }
     setOcrBusy(false);
   };

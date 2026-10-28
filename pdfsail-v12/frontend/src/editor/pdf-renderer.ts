@@ -1,9 +1,7 @@
 import * as pdfjs from "pdfjs-dist";
+import { PDFJS_WORKER_SRC } from "../pdfjs-worker-src";
 
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url
-).toString();
+pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_SRC;
 
 export async function renderPage(
   pdf: pdfjs.PDFDocumentProxy,

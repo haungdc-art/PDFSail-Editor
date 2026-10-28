@@ -12,6 +12,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useEditor } from "../core/EditorProvider";
 import { useI18n } from "../../i18n/I18nProvider";
+import { segBlockId } from "../binding/docBlocksWriteGuard";
 
 const FONT_SIZE_STEP = 2;
 const FONT_SIZE_MIN = 8;
@@ -66,7 +67,7 @@ export function EditModeToolbar() {
       s.id === editingSegment.id ? { ...s, font: { ...s.font, size: newSize } } : s
     ));
     // 同步到 docBlocks
-    const blockId = `seg_block_${editingSegment.id}`;
+    const blockId = segBlockId(editingSegment.id);
     setBlocks((prev) => prev.map((b) =>
       b.id === blockId ? { ...b, fontSize: newSize } : b
     ));
@@ -85,7 +86,7 @@ export function EditModeToolbar() {
     setSegments((prev) => prev.map((s) =>
       s.id === editingSegment.id ? { ...s, font: { ...s.font, size: newSize } } : s
     ));
-    const blockId = `seg_block_${editingSegment.id}`;
+    const blockId = segBlockId(editingSegment.id);
     setBlocks((prev) => prev.map((b) =>
       b.id === blockId ? { ...b, fontSize: newSize } : b
     ));
@@ -104,7 +105,7 @@ export function EditModeToolbar() {
     ));
     // 保留 docBlock 但清空 text：导出时需据此位置画白底遮罩覆盖原文，
     // 否则删除的文本仍会出现在导出 PDF / paywall 缩略图中
-    const blockId = `seg_block_${editingSegment.id}`;
+    const blockId = segBlockId(editingSegment.id);
     setBlocks((prev) => {
       const existingIdx = prev.findIndex((b) => b.id === blockId);
       if (existingIdx >= 0) {

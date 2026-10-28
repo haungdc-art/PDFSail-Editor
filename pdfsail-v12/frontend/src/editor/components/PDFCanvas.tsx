@@ -39,6 +39,23 @@ import { TextEditOverlay } from "./TextEditOverlay";
 import type { DrawGlyphCommand } from "../../document-model/render-command";
 
 // ═══════════════════════════════════════════════════════════════
+// 2d-1-B · OCR Projection Geometry Preservation
+//
+// OCR 投影文本块（block.source?.kind === "ocr"）由 Core 文档经 docBlocks 投影层
+// 渲染为 DOM。OCR 已通过检测确定每段文字的 x/y/width/height/文本，这些坐标就是
+// 最终视觉语义；若交给浏览器按 white-space: normal / word-wrap 重新排版，会与
+// OCR 已定位语义冲突（错误换行、行高错位、字距漂移）。
+//
+// 修复范围（用户裁决，方案 1）：只在投影渲染层做 line-level preserve，禁止浏览器
+// 重排版；不修改 Core schema / OCR migration / export / GlyphRenderer。
+// 判据：block.source?.kind === "ocr"。普通文本（pdf-native 投影 / 用户创作）保持原 CSS。
+// ═════════════════════════════════════════════════════════════
+
+import { isOcrProjectionBlock, getOcrProjectionStyle, getDefaultBlockTextStyle } from "../features/ocr-projection-style";
+import { isCoreProjectionBlock } from "../features/docBlocksProjectionMerge";
+import { getDocBlocksGeneration, segBlockId, isSegBlockId } from "../binding/docBlocksWriteGuard";
+
+// ═══════════════════════════════════════════════════════════════
 // M7.8-047 · C2 Editing Hit Geometry（EditingHitGeometry）
 // 复用 edit-transform-geometry.glyphQuad（唯一合法 C2 实现），
 // 数据源只读 glyphCommands（= __editableDocument.pages[].blocks[].lines[].glyphs[]）。
@@ -1082,6 +1099,14 @@ interface PDFCanvasProps {
   dragRef: React.MutableRefObject<{ id: string; ox: number; oy: number; ox0: number; oy0: number } | null>;
   resizeRef: React.MutableRefObject<{ id: string; startX: number; startY: number; initW: number; initH: number } | null>;
   addBlock: (type: Block["type"], extra?: any) => void;
+  /**
+   * B3-C-5-E-B-B：PDFCanvas 的 image 放置分支不开辟第二套图片 ingestion。
+   * 点击 image 模式后落点不持有图片字节，故改为触发文件选择器（复用 MainToolbar 通道），
+   * 由 handleImageSelect → Core commit 完成添加。绝不直接写 docBlocks ImageBlock。
+   */
+  requestImageFile?: () => void;
+  /** B3-C-5-E-B-H-Impl：图片删除统一委托给上层（Core-owned 走 DeleteObjectCommand，否则走 docBlocks filter）。 */
+  deleteImage?: (imageId: string) => void;
   handleOCRRegion: (x: number, y: number, w: number, h: number) => void;
   /** Bug 7: 画布空状态上传组件使用 */
   handleUpload: (e: React.ChangeEvent<HTMLInputElement>) => void;
@@ -1204,6 +1229,10 @@ interface PDFCanvasProps {
   editedLines?: ReadonlySet<string>;
   /** M7.7-004U: 已编辑行 → 真实文字覆盖盒（openTextEditSession 扫描 canvas 扩展），commit 后 mask 用 */
   editedLineBoxes?: Map<string, BBox>;
+  /** F3B-6.4B-P2-A: **当前页**的文档 line identity（`EditablePage.blocks[].lines[].id`）。
+   *  空行没有 RenderCommand ⇒ 需要它补上 mask identity，否则 B-6.1 的 box 不可达（P2）。
+   *  由 PDFEditor 按当前 `page` 从 EditableDocument 收集（多页隔离仍成立）。 */
+  documentPageLineIds?: ReadonlySet<string>;
 }
 
 export function PDFCanvas({
@@ -1212,6 +1241,8 @@ export function PDFCanvas({
   dragRef,
   resizeRef,
   addBlock,
+  requestImageFile,
+  deleteImage,
   handleOCRRegion,
   handleUpload,
   exitEditMode,
@@ -1254,6 +1285,7 @@ export function PDFCanvas({
   // M7.7-004U: 升级为 line 级 —— 已编辑的「行」渲染 overlay，未编辑行保持 canvas 扫描原样
   editedLines,
   editedLineBoxes,
+  documentPageLineIds,
 }: PDFCanvasProps) {
   const [canvasUploading, setCanvasUploading] = useState(false);
   // 记录 mousedown 起始位置，用于区分单击和拖拽（OCR 单击编辑）
@@ -1345,7 +1377,7 @@ export function PDFCanvas({
   }, [segments]);
 
   // 过滤掉 seg_block_ 前缀的 block（它们是 segment 修改的镜像，只用于导出，不在画布上显示）
-  const pageBlocks = docBlocks.filter((b) => b.page === page && !b.id.startsWith("seg_block_"));
+  const pageBlocks = docBlocks.filter((b) => b.page === page && !isSegBlockId(b.id));
 
   // M7.8-047 · C2 命中所需的辅助函数（仅本组件内使用，复用模块级 hitBlockByGlyphQuad）
   /** 由 block 构造 setEditingBlock 所需的编辑对象（保持 R8：编辑框宽度仍用 b.w，hit 与 box 分离） */
@@ -1438,13 +1470,17 @@ export function PDFCanvas({
           onClick={(e) => {
             setSelectedBlockId(null);
             if (!addingType || addingType === "ocr" || !wrapperRef.current) return;
+            // B3-C-5-E-B-B：image 放置不开辟第二套 ingestion，改走文件选择器 → Core commit
+            if (addingType === "image") {
+              requestImageFile?.();
+              setAddingType(null);
+              return;
+            }
             const rect = wrapperRef.current.getBoundingClientRect();
             setBlocks((prev) => [...prev, {
               id: uuid(), type: addingType, page,
               x: e.clientX - rect.left, y: e.clientY - rect.top,
-              w: addingType === "image" ? 120 : 60,
-              h: addingType === "image" ? 120 : 30,
-              src: addingType === "image" ? "https://placehold.co/120x120" : undefined,
+              w: 60, h: 30,
             } as Block]);
             setAddingType(null);
           }}
@@ -1567,6 +1603,8 @@ export function PDFCanvas({
                     viewMode={viewMode}
                     editedLines={editedLines}
                     editedLineBoxes={editedLineBoxes}
+                    // F3B-6.4B-P2-A: 补上当前页的文档 line identity（空行 mask 需要的身份来源）
+                    documentPageLineIds={documentPageLineIds}
                     onGlyphClick={(info) => onGlyphClick?.(info)}
                     onGlyphSelect={(info) => onGlyphSelect?.(info)}
                     onGlyphEdit={(glyph, newText) => onGlyphEdit?.(glyph, newText)}
@@ -1617,12 +1655,34 @@ export function PDFCanvas({
                     使 EditableTextNode 成为该 segment 的唯一显示源。 */}
                 {segments.length > 0 && (
                   segments
-                    .filter((seg) => seg.text !== seg.originalText)
+                    .filter((seg) => seg.text !== seg.originalText || (seg.source?.lineId != null && segments.some((s) => s.source?.lineId === seg.source?.lineId && (s.text !== s.originalText || s.id === editingSegmentId))))
                     .map((seg) => (
                       <div
                         key={`seg-mask-${seg.id}`}
                         data-layer="segment-mask"
-                        data-segment-id={seg.id}
+                        // ★ F3B-6.27-G1：`data-segment-id` 必须**唯一指向** EditableTextNode。
+                        //
+                        //   实测缺陷（tests/e2e/f3b627-reedit-scramble.spec.ts，编辑→提交→再次编辑）：
+                        //     本遮罩只在 `seg.text !== seg.originalText`（已编辑）后渲染，
+                        //     一旦出现就与 EditableTextNode **共用同一个** `data-segment-id`
+                        //     ⇒ 文档里出现两个同 id 节点。而 `querySelector("[data-segment-id=X]")`
+                        //     按文档顺序取第一个 ⇒ 再进入编辑时命中的是**本遮罩**
+                        //     （空文本、非 contenteditable、不含选区），而不是真正的编辑面。
+                        //     ⇒ `computeSegmentDomOffset` 读不到选区 ⇒ Core ownership **认领失败**
+                        //     （fail-closed）⇒ `corePresentationActive` 为假 ⇒ 编辑面退回
+                        //     **单行**模型（`nowrap` + `keep-all` + 1 行高）去渲染上一次遗留的
+                        //     **整段**文本 ⇒ 折行溢出叠字、`日期：` 被 canvas 与编辑面双画。
+                        //
+                        //   该属性被代码库**普遍**用于解析段元素（computeSegmentDomOffset/Range、
+                        //   A′ 同步、mask、命中测试、多个 e2e）⇒ 同 id 歧义会让它们全部变成
+                        //   「取决于文档顺序」的不确定行为。故遮罩改用**独立**属性携带归属信息。
+                        // ★ F3B-6.27-P1：编辑态下把**同一 lineId**（同一 Core 段落）的
+                        //   所有 segment 一并遮住 —— 方案 A 的编辑面承载整段（含兄弟段
+                        //   的 `日期：` 前缀），只遮 `text !== originalText` 会让兄弟段
+                        //   原字形透出（编辑中）与双画（提交后）。
+                        //   本遮罩是纯白矩形 + pointerEvents:none，从不渲染文本 ⇒ 安全。
+                        //   完整论证与授权见 frozen-renderer-guard.ts 的 P1 块。
+                        data-mask-segment-id={seg.id}
                         style={{
                           position: "absolute",
                           left: seg.cssX - 1,
@@ -1658,12 +1718,17 @@ export function PDFCanvas({
                       onChange={(id, newText) => {
                         // 1. 更新 segments state（即时视觉反馈）
                         handleSegmentChange(id, newText);
+                        // 1b. F3B-6.4B-2：canonical commit —— 让 Segment 编辑**立即**进入
+                        //     EditableDocument + OperationHistory，消除「只有导出时才对账」的 stale window。
+                        //     由 window.__segmentCanonicalCommit 门控（缺省 off，见 segmentCommit.ts）。
+                        onSegmentCommit?.(id, newText);
                         // Segment 自己的遮罩精确覆盖本段原文。不能再把它送进 line-level
                         // mask：EditableDocument 此刻尚未 mutation，line-level 路径会把整行
                         // 当作已变动，遮住同一行前面已提交段的下半部分。
                         // 2. 同步到 docBlocks 作为 text block（跨页保留 + exportPDF 导出修改后内容）
                         //    用固定 blockId 便于 upsert，避免重复添加
-                        const blockId = `seg_block_${id}`;
+                        const blockId = segBlockId(id);
+                        // B2-4：seg_block identity 集中生成，确保整链路一致。
                         setBlocks((prev) => {
                           const existingIdx = prev.findIndex((b) => b.id === blockId);
                           const newBlock = {
@@ -1761,7 +1826,12 @@ export function PDFCanvas({
                     onMouseDown={(e) => {
                       e.stopPropagation();
                       clickStartRef.current = { x: e.clientX, y: e.clientY };
-                      dragRef.current = { id: b.id, ox: e.clientX, oy: e.clientY, ox0: b.x, oy0: b.y };
+                      // B2-2：投影块（Core/EditableDocument 文本投影）只读，不允许被拖拽这类
+                      // authoring writer 改写 —— 否则下次投影会覆盖，且拖拽过程写的是无意义镜像。
+                      // 携带当前 generation，拖拽过程（mousemove × N）写盘时若 generation 已变
+                      // （换文档/re-import）⇒ 拒绝写入，避免旧映射污染新文档。
+                      if (isCoreProjectionBlock(b)) return;
+                      dragRef.current = { id: b.id, ox: e.clientX, oy: e.clientY, ox0: b.x, oy0: b.y, generation: getDocBlocksGeneration() };
                     }}
                     onDoubleClick={(e) => {
                       if (b.type === "text") {
@@ -1769,13 +1839,19 @@ export function PDFCanvas({
                         // M7.8-047 (T3): 双击与单击使用完全相同的 C2 EditingHitGeometry 判定（不得出现单/双轨）。
                         tryStartEditingAtClient(e.clientX, e.clientY, e.currentTarget as HTMLElement);
                       } else {
-                        setBlocks((prev) => prev.filter((x) => x.id !== b.id));
+                        // B3-C-5-E-B-H-Impl：图片删除统一走上层（Core-owned → DeleteObjectCommand，否则 → docBlocks filter）。
+                        deleteImage?.(b.id);
                       }
                     }}
                     style={{
                       position: "absolute", left: b.x, top: b.y, width: b.w,
-                      // 文本块用 minHeight 让多行文本自动撑高，其他块固定 height
-                      ...(b.type === "text" ? { minHeight: b.h } : { height: b.h }),
+                      // 文本块用 minHeight 让多行文本自动撑高，其他块固定 height。
+                      // OCR 投影文本（source.kind === "ocr"）必须固定 height = b.h，禁止浏览器重排版撑高。
+                      ...(b.type === "text"
+                        ? isOcrProjectionBlock(b)
+                          ? { height: b.h }
+                          : { minHeight: b.h }
+                        : { height: b.h }),
                       border: b.type === "highlight" && (b.hType === "underline" || b.hType === "strike" || b.hType === "wavy")
                         ? selectedBlockId === b.id ? "2px solid #8b5cf6" : "1px solid transparent"
                         : b.type === "highlight" ? `2px solid ${b.color || "#facc15"}`
@@ -1792,6 +1868,8 @@ export function PDFCanvas({
                         : b.type === "comment" ? "rgba(99,102,241,0.06)"
                         // M7.6-IMPLEMENT-005: native-canvas 下文本块不绘白底（Native Canvas Invariant）
                         : b.type === "text" ? (nativeHideBlockVisual ? "transparent" : "#fff")
+                        // B3-C-5-E-B-H-Impl：Core-owned 图片在 docBlocks 层只作透明命中区（真实像素由 Core 渲染链绘制）。
+                        : b.type === "image" ? "transparent"
                         : "rgba(59,130,246,0.04)",
                       // 文本块：从顶部开始排列（不再垂直居中），让多行文字自然换行
                       display: "flex",
@@ -1804,20 +1882,11 @@ export function PDFCanvas({
                     {b.type === "text" && !nativeHideBlockVisual && (
                       <span
                         data-block-text-visible="1"
-                        style={{
-                        width: "100%", minHeight: "100%", padding: 0,
-                        // 替换模式：必须继承原始 fontSize，不能自动缩小字体塞进 bbox
-                        fontSize: b.fontSize || Math.max(Math.min(b.h * 0.65, b.h - 6), 12),
-                        lineHeight: 1.3,
-                        fontFamily: b.fontFamily || "'Arial','Helvetica','SimSun','Noto Serif CJK SC',sans-serif",
-                        background: "#fff",
-                        // 修复：nowrap + visible 导致文字水平溢出叠到原文上
-                        // 改为 pre-wrap（自动换行）+ visible（多行自动撑高 block）
-                        whiteSpace: "pre-wrap",
-                        overflow: "visible",
-                        wordBreak: "break-word",
-                        color: b.color || "#000000",
-                      }}>
+                        style={
+                          isOcrProjectionBlock(b)
+                            ? getOcrProjectionStyle(b)
+                            : getDefaultBlockTextStyle(b)
+                        }>
                         {b.text}
                       </span>
                     )}
@@ -1870,7 +1939,9 @@ export function PDFCanvas({
                       <div
                         onMouseDown={(e) => {
                           e.stopPropagation(); e.preventDefault();
-                          resizeRef.current = { id: b.id, startX: e.clientX, startY: e.clientY, initW: b.w, initH: b.h };
+                          // B2-2：携带当前 generation（理由同拖拽）。投影块不可缩放。
+                          if (isCoreProjectionBlock(b)) return;
+                          resizeRef.current = { id: b.id, startX: e.clientX, startY: e.clientY, initW: b.w, initH: b.h, generation: getDocBlocksGeneration() };
                         }}
                         style={{
                           position: "absolute", right: -5, bottom: -5,

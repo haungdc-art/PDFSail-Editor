@@ -19,6 +19,7 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useEditor } from "../core/EditorProvider";
 import { useI18n } from "../../i18n/I18nProvider";
+import { segBlockId } from "../binding/docBlocksWriteGuard";
 
 interface Match {
   segmentId: string;
@@ -85,7 +86,7 @@ export function FindReplaceBar({ onClose }: { onClose: () => void }) {
 
   // 同步 segment 修改到 docBlocks（与 FloatingToolbar / PDFCanvas 中的逻辑一致）
   const syncToBlocks = useCallback((segId: string, newText: string, seg: any) => {
-    const blockId = `seg_block_${segId}`;
+    const blockId = segBlockId(segId);
     setBlocks((prev) => {
       const existingIdx = prev.findIndex((b) => b.id === blockId);
       const newBlock = {

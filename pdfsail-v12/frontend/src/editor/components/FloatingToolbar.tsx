@@ -17,6 +17,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useEditor } from "../core/EditorProvider";
 import { useI18n } from "../../i18n/I18nProvider";
+import { segBlockId } from "../binding/docBlocksWriteGuard";
 // Task-011B: EditTool 依赖注入（Strangler 双路径，Toolbar 只调 execute，保留 legacy）
 import type { EditTool } from "../../document-model/edit-tool";
 
@@ -194,7 +195,7 @@ export function FloatingToolbar({ editTool }: { editTool: EditTool }) {
     const updated = fullText.slice(0, startOffset) + newText + fullText.slice(endOffset);
     handleSegmentChange(segmentId, updated);
     // 同步到 docBlocks（与 PDFCanvas 中 EditableTextNode.onChange 一致）
-    const blockId = `seg_block_${segmentId}`;
+    const blockId = segBlockId(segmentId);
     const seg = segments.find((s) => s.id === segmentId);
     if (seg) {
       setBlocks((prev) => {

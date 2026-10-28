@@ -7,6 +7,15 @@
  * applySegmentEditsToDocument 用 Segment.source（glyph 区间，由 buildSegmentFromGlyphs
  * 在创建 Segment 时直接由 glyph run 算出）精确定位并 range-mutation，
  * 完全不依赖 indexOf(originalText)。
+ *
+ * ── F3B-6.17-3C-3B：架构身份 = **Legacy export materialization adapter** ────────
+ *   · 本模块**不属于** Segment 的正常 semantic editing path（正常路径见 `segmentCommit.ts`
+ *     头部注释：`Segment → Core Command → EditorDocument → Core Export`）。
+ *   · 唯一 production caller = `useExport` 的 **Legacy 导出分支**（`if (!usedCore)`）：
+ *     `legacyDocForExport = allEditSegs.length ? applySegmentEditsToDocument(doc, allEditSegs) : doc`。
+ *   · Core success / `ownership === "core"` ⇒ 该分支不执行 ⇒ **本模块与其 3 处 `mutateLineText`
+ *     调用均不可达**（由 `C6/C7/C8` guard 固定）。
+ *   · ⚠️ 不要新增第二层 wrapper 来「包装」本函数：不消除任何依赖，只会增加层级。
  */
 import type { EditableDocument, EditableLine } from "../../document-model";
 import { mutateLineText } from "../../document-model";
@@ -20,7 +29,7 @@ import type { Segment } from "../../editor-engine/types";
  * 「同一 block 内按 lineIdx 定位」——这是跨 Producer 的语义对齐层（Source Mapping），而不是假设
  * 所有 Producer 共用同一套 id convention。见 M7.8-048。
  */
-function findLineBySource(
+export function findLineBySource(
   doc: EditableDocument,
   blockId: string,
   lineId: string,
@@ -40,13 +49,35 @@ function findLineBySource(
 }
 
 /**
- * 把 segment 层的文本编辑同步进 EditableDocument。
+ * 把 segment 层的文本编辑同步进 EditableDocument（legacy safety-net）。
  *
- * M7.8-040：按 source 精确 range mutation。
- *   - 按 (blockId, lineId) 分组；组内按 startGlyphIndex 升序；
- *   - 逐段 mutateLineText(next, { start, end })，用 shift 校正前序编辑的长度偏移
- *     → 同一行多段同时编辑（含变长/变短）精确，互不串位。
+ * ── 坐标契约（F3B-6.4B-5 / 5.1，务必先读）────────────────────────────────
+ * 本函数接收的 segment range **必须是当前文档坐标（current coordinates）**，
+ * 而不是 Segment 的 source（PDF 原始）坐标。
+ *
+ * 三层坐标语义，不要混为一谈：
+ *   · 原始 Segment truth（`Segment.source` / `ledger` 的基准）→ **source coordinates**
+ *   · legacy safety-net orchestration input（本函数入参）      → **current coordinates**
+ *   · 本函数内部的批次 `shift`                                → 仅处理「该 current 批次内部」
+ *                                                              pending segment 之间的相对位移
+ *
+ * 为什么入参必须是 current：本函数的 `shift` 初值恒为 **0**，只累加**入参批次内部**的位移
+ * （见下方循环）。因此若调用方把「已经 canonical commit 的 segment」从批次里剔除
+ * （orchestration 的 canonicalized 过滤），批次就不再完整，后续 segment 会被系统性压回
+ * source 位置 ⇒ 错位。故换算由 **orchestration 层**负责（`PDFEditor.getLegacyPendingSegments`
+ * 用 `ledger.currentRange(sourceSegmentKey(source))` 换算并**复制**对象）。
+ *
+ * ⚠️ 本 binding **不认识 Ledger / canonical commit / undo-redo**，也不接收 `initialShift`：
+ *    它只消费「一个 current 坐标批次」，并在批次内部自行处理相对位移。
+ *
+ * M7.8-040：按 (blockId, lineId) 分组；组内按 startGlyphIndex 升序；
+ *   逐段 mutateLineText(next, { start, end })，用 shift 校正前序编辑的长度偏移
+ *   → 同一行多段同时编辑（含变长/变短）精确，互不串位。
  * 仅当 Segment 无 source（旧状态，生产路径均已带 source）才走下方 legacy indexOf 兜底。
+ *
+ * ── F3B-6.17-3C-3B：**Legacy export materialization adapter** ──────────────────
+ * 唯一 production 调用点在 `useExport` 的 `if (!usedCore)` Legacy 导出分支内；
+ * Core 成功接管下载时（`usedCore === true`）**不经过本函数**。
  */
 export function applySegmentEditsToDocument(
   doc: EditableDocument,
@@ -55,7 +86,8 @@ export function applySegmentEditsToDocument(
   const edited = segments.filter((s) => s.text !== s.originalText);
   if (!edited.length) return doc;
 
-  // 主路径：按 source 精确 range mutation（不依赖 indexOf）。
+  // 主路径：按**入参 range**（= current coordinates）精确 mutation（不依赖 indexOf）。
+  // `shift` 初值 0 ⇒ 只校正本批次内部的相对位移（坐标换算由 orchestration 负责）。
   const groups = new Map<string, Segment[]>();
   for (const seg of edited) {
     if (!seg.source) continue; // 无 source → 下方 legacy 兜底
