@@ -16,3 +16,13 @@ import pdfjsWorker from "pdfjs-dist/build/pdf.worker.mjs?url";
 
 export const PDFJS_WORKER_SRC = pdfjsWorkerMin;
 export const PDFJS_WORKER_SRC_UNCOMPRESSED = pdfjsWorker;
+
+// ★ 2026-10-28（线上验收「Setting up fake worker failed: Failed to fetch dynamically
+//   imported module」）：预热 worker 资源。worker chunk（≈1.3MB）此前在**首次打开 PDF**
+//   时才被动态 import，若彼时到 CDN 的连接抖动（实测：同会话内 Google 广告域同报
+//   ERR_CONNECTION_CLOSED），pdf.js 内部**无重试** ⇒ 单次抖动即整页失败。
+//   这里在模块加载（编辑器 boot）时即发起低优先级 fetch：暖化 TCP/TLS 连接并促发
+//   HTTP/2 流复用，把网络风险前置。失败静默（预热是尽力而为，真实失败由重试兜底）。
+try {
+  fetch(pdfjsWorkerMin, { priority: "low" } as RequestInit).catch(() => {});
+} catch {}

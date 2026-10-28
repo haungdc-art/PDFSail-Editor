@@ -11953,7 +11953,22 @@ const outcome = buildCoreRenderSourceFromDocument(f28SessionDoc ?? documentOf(se
         // console.warn("[M7.7-IMPLEMENT-004] parsePdfFontMetrics failed:", e);
         pageFontMetricsRef.current = null;
       }
-      const pdf = await pdfjsLib.getDocument({ data: buf.slice(0), cMapUrl: "/cmaps/", cMapPacked: true, standardFontDataUrl: "/standard_fonts/" }).promise;
+      // ★ 2026-10-28（线上验收「fake worker failed」）：pdf.js 的 worker 加载**无重试**——
+      //   首次动态 import worker chunk 若遇连接抖动即整页失败（实测线上单次失败即打不开 PDF）。
+      //   这里对 worker 加载类错误**自动重试一次**（抖动窗口通常短；重试前延迟让连接恢复）。
+      //   注意：getDocument 会接管 data（transfer）⇒ 每次尝试都必须用新副本（buf.slice(0)）。
+      const loadPdfjsDoc = async (): Promise<pdfjsLib.PDFDocumentProxy> => {
+        try {
+          return await pdfjsLib.getDocument({ data: buf.slice(0), cMapUrl: "/cmaps/", cMapPacked: true, standardFontDataUrl: "/standard_fonts/" }).promise;
+        } catch (e) {
+          const msg = String((e as Error)?.message || e);
+          if (!/fake worker|dynamically imported|worker/i.test(msg)) throw e;
+          console.warn("[PDF-LOAD] worker 加载失败，自动重试一次:", msg.slice(0, 140));
+          await new Promise((r) => setTimeout(r, 800));
+          return await pdfjsLib.getDocument({ data: buf.slice(0), cMapUrl: "/cmaps/", cMapPacked: true, standardFontDataUrl: "/standard_fonts/" }).promise;
+        }
+      };
+      const pdf = await loadPdfjsDoc();
       setPdfDoc(pdf);
       // 调试钩子：暴露 pdf.js 文档代理，供 M7.8-017A 等控制台探针读取 commonObjs（纯可观测性，不改逻辑）
       (window as any).__pdfDoc = pdf;
