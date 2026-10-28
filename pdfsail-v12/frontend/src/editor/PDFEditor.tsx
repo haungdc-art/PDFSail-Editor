@@ -11964,7 +11964,7 @@ const outcome = buildCoreRenderSourceFromDocument(f28SessionDoc ?? documentOf(se
     } catch (err) {
       console.error("[Issue-003] PDF 加载失败:", err);
       setPdfLoading(false);
-      setPdfError(`无法打开该 PDF：${err instanceof Error ? err.message : "文件无效或已损坏"}。请上传一个有效的 PDF 文件。`);
+      setPdfError(`Unable to open this PDF: ${err instanceof Error ? err.message : "The file is invalid or corrupted"}. Please upload a valid PDF file.`);
       return;
     }
     if (workspaceMode) setShowIntentModal(true);
@@ -14001,7 +14001,7 @@ const outcome = buildCoreRenderSourceFromDocument(f28SessionDoc ?? documentOf(se
               display: "flex", alignItems: "center", justifyContent: "center",
               fontSize: 28, marginBottom: 16,
             }}>!</div>
-            <p style={{ fontSize: 17, fontWeight: 600, color: "#1e293b", marginBottom: 8 }}>无法打开这个 PDF</p>
+            <p style={{ fontSize: 17, fontWeight: 600, color: "#1e293b", marginBottom: 8 }}>Unable to open this PDF</p>
             <p style={{ fontSize: 14, color: "#64748b", maxWidth: 420, marginBottom: 20 }}>{pdfError}</p>
             <button
               onClick={() => setPdfError(null)}
