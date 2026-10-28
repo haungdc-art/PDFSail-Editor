@@ -88,3 +88,9 @@ PDFEditor.tsx、PDFCanvas、TextEditOverlay、FloatingToolbar、EditModeToolbar�
 **遗留**：`[ExportRenderer][CID] fallback:NotoSansSC 字体创建失败 Error: Unknown font format`——同步进来的 `NotoSansSC-Regular.otf`（8.33MB）在 fontkit 解析失败，fallback 来源自动退出（导出不受影响，但影响生僻 CJK 的导出保真度），待单独排查。
 
 **测试资产**：`tests/e2e/f3b-planb-accept*.spec.ts`、`f3b-planb-e01-*.spec.ts`（本地，gitignored）。
+
+## 9. 验收收尾（2026-10-28）
+
+- **验收结果**：用户重新构建后按原操作验收，**编辑 → 下载 → R2 上传 → 跳转主站 card 页全链路走通**，E-01 不再出现（证实为旧构建问题）。
+- **广告控制台噪音**：用户贴的 doubleclick / pagead2 / adsbygoogle 错误全部来自 **www.pdfsail.com 主站 card 页面**（AdSense + gtag），不是本编辑器项目代码（本项目无任何 AdSense 引用；仅 index.html 有 Clarity + gtag 转化埋点，保留）。网络层失败的红字无法用 JS 抑制，用户裁定**忽略（方案 A）**，不改主站。
+- **方案 B 验收正式通过。**
