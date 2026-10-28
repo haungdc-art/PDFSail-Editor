@@ -78,6 +78,90 @@ function inferKind(text: string): TextOperatorKind {
   return "simple";
 }
 
+/**
+ * M1-B (kerning fidelity): rebuild a TJ array while PRESERVING the original
+ * inter-glyph kerning adjustments.
+ *
+ * raw e.g. `[<0041> -120 <0042> 30 <0043>] TJ`. When the replacement has the
+ * same glyph count as the original TJ array, we swap each glyph code for the
+ * new one but keep every kerning number exactly where it was — so the
+ * rewritten line keeps the original spacing (no "wider/tighter" drift). When
+ * counts differ (length-changed) we cannot preserve the structure 1:1, so we
+ * return null and the caller falls back to the flattened single-element TJ
+ * (overlay handles length-changed fidelity).
+ *
+ * @param raw         original operator string (e.g. `[<0041> -120 <0042>] TJ`)
+ * @param replacement replacement text
+ * @param encodeGlyph maps a single replacement char → its PDF glyph token
+ *                    (e.g. `<0042>` for cid, `(B)` for simple)
+ */
+function tryRebuildTjWithKerning(
+  raw: string | undefined,
+  replacement: string,
+  encodeGlyph: (ch: string) => string,
+): { operator: string; text: string } | null {
+  if (!raw) return null;
+  const open = raw.indexOf('[');
+  const close = raw.lastIndexOf(']');
+  if (open === -1 || close === -1 || close < open) return null;
+  const content = raw.slice(open + 1, close);
+
+  const tokens = tokenizeTjArray(content);
+  const glyphCount = tokens.filter((t) => t.type === 'glyph').length;
+  if (glyphCount !== replacement.length) return null; // length-changed → caller flattens
+
+  let k = 0;
+  const parts: string[] = [];
+  for (const t of tokens) {
+    if (t.type === 'glyph') {
+      if (k >= replacement.length) return null;
+      parts.push(encodeGlyph(replacement[k]));
+      k++;
+    } else {
+      parts.push(t.raw);
+    }
+  }
+  if (k !== replacement.length) return null;
+  return { operator: `[${parts.join(' ')}] TJ`, text: replacement };
+}
+
+/** Tokenize the inside of a TJ array into glyph tokens and kerning numbers. */
+function tokenizeTjArray(
+  content: string,
+): Array<{ type: 'glyph'; raw: string } | { type: 'num'; raw: string }> {
+  const out: Array<{ type: 'glyph'; raw: string } | { type: 'num'; raw: string }> = [];
+  let i = 0;
+  while (i < content.length) {
+    const c = content[i];
+    if (c === '<') {
+      const end = content.indexOf('>', i);
+      if (end === -1) break;
+      out.push({ type: 'glyph', raw: content.slice(i, end + 1) });
+      i = end + 1;
+    } else if (c === '(') {
+      let j = i + 1;
+      let depth = 1;
+      while (j < content.length && depth > 0) {
+        if (content[j] === '\\') j += 2;
+        else if (content[j] === '(') { depth++; j++; }
+        else if (content[j] === ')') { depth--; j++; }
+        else j++;
+      }
+      out.push({ type: 'glyph', raw: content.slice(i, j) });
+      i = j;
+    } else if (c === '+' || c === '-' || (c >= '0' && c <= '9')) {
+      let j = i;
+      if (c === '+' || c === '-') j++;
+      while (j < content.length && ((content[j] >= '0' && content[j] <= '9') || content[j] === '.')) j++;
+      out.push({ type: 'num', raw: content.slice(i, j) });
+      i = j;
+    } else {
+      i++;
+    }
+  }
+  return out;
+}
+
 /** 生成新算子内容（不含离屏换行，调用方负责夹在 BT/ET 之间的定位指令中） */
 export function composeReplacementOperator(
   kind: TextOperatorKind,
@@ -85,15 +169,21 @@ export function composeReplacementOperator(
   replacement: string,
   /** M7.7-004A：可选 CID hex（Unicode → CID 编码结果）；提供时优先于 encodeTextAsCidHex */
   cidHex?: string,
+  /** M1-B：原始算子 raw（用于 TJ 保真重建字距；仅 op==="TJ" 且等长替换时使用） */
+  originalRaw?: string,
 ): { operator: string; text: string } {
   if (kind === "cid") {
     const hex = cidHex ?? encodeTextAsCidHex(replacement);
     if (op === "Tj") return { operator: `<${hex}> Tj`, text: hex };
-    return { operator: `[<${hex}>] TJ`, text: hex };
+    // M1-B: equal-length → preserve original kerning structure
+    const rebuilt = tryRebuildTjWithKerning(originalRaw, replacement, (ch) => `<${encodeTextAsCidHex(ch)}>`);
+    return rebuilt ?? { operator: `[<${hex}>] TJ`, text: hex };
   }
   const lit = escapePdfLiteral(replacement);
   if (op === "Tj") return { operator: `(${lit}) Tj`, text: replacement };
-  return { operator: `[(${lit})] TJ`, text: replacement };
+  // M1-B: equal-length → preserve original kerning structure
+  const rebuilt = tryRebuildTjWithKerning(originalRaw, replacement, (ch) => `(${escapePdfLiteral(ch)})`);
+  return rebuilt ?? { operator: `[(${lit})] TJ`, text: replacement };
 }
 
 /**
@@ -112,7 +202,11 @@ export function replaceTextOperator(input: ReplaceTextOperatorInput): ReplaceTex
     cidHex = hex;
   }
 
-  const composed = composeReplacementOperator(kind, resolved.operator.op, replacement, cidHex);
+  // M1-B: 从内容流按 byteStart/byteEnd 切片拿到「真实 raw 算子」（含 TJ 字距数字），
+  // 供 composeReplacementOperator 等长替换时保真重建。注意：不能用 operator.raw
+  // （那里是解码后文本，供 content-stream-patch 的 oldText round-trip 校验使用）。
+  const originalRaw = streamText.slice(resolved.byteStart, resolved.byteEnd);
+  const composed = composeReplacementOperator(kind, resolved.operator.op, replacement, cidHex, originalRaw);
   const newOperatorBytes = new TextEncoder().encode(composed.operator);
 
   const target: ContentStreamPatchTarget = {

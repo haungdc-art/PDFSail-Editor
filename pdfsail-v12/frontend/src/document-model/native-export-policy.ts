@@ -124,23 +124,13 @@ export function buildNativeExportPlan(doc: EditableDocument): NativeExportPlan {
           return;
         }
         const replText = st?.replacementText ?? line.glyphs.map((g) => g.char).join("");
-        // M7.8-022A: 长度变化的替换禁用 native rewrite，强制走 overlay。
-        // 根因：composeReplacementOperator（replace-text-operator.ts）会把 TJ 重建为
-        //   单元素数组 `[(全文)] TJ`，原 PDF TJ 数组中的字距调整（kerning）数字全部丢失；
-        //   长度变化还会使后续字形横向累积偏移 → 视觉"换行/下移/占位"（用户报告现象）。
-        // 等长替换才能保持算子结构与字距保真；长度变化改用 overlay
-        // （mask + 逐 glyph 重绘，几何由 glyph.bbox 精确控制）。
-        if (st.originalText.length !== replText.length) {
-          if (typeof console !== "undefined") {
-            console.log(
-              `[M7.8-022A][NATIVE_SKIP] blockId=${block.id} lineIndex=${li} ` +
-                `reason="length-changed" → fallback overlay ` +
-                `(origLen=${st.originalText.length} replLen=${replText.length})`,
-              "color:#f59e0b;",
-            );
-          }
-          return;
-        }
+        // M1-B: 长度变化的替换现在也走 native rewrite（不再强制 overlay）。
+        //   composeReplacementOperator 对长度变化生成扁平 `[<hex>] TJ`（单元素），
+        //   PDF 按字体自然 Widths 自动推进每个字形 → 同字体、自然字宽、无重绘盒，
+        //   保真度高于 overlay（红绘盒可能字体/度量不一致、产生 mask 残影）。
+        //   原 TJ 的手动字距数字在字形已改变时本就无法保留，自然字宽是合理结果。
+        //   整算子对齐（originalText === 算子整文本）已由 st.originalText 保证；
+        //   部分算子匹配会在 resolveBoundRun 处 not-found → 整批回退 overlay（安全）。
         runs.push({
           blockId: block.id,
           lineIndex: li,
