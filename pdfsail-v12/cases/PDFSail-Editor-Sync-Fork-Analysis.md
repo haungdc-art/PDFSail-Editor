@@ -65,3 +65,26 @@ PDFEditor.tsx、PDFCanvas、TextEditOverlay、FloatingToolbar、EditModeToolbar�
 3. 段落编辑/表格 cell 编辑/导出重绘的**深度验收**（多行段落、cell 表格、导出重绘管线）建议用真实用户 PDF 走一轮用户验收。
 4. 上游 `tests/`（e2e 资产）在 .gitignore，未随同步；上游 155+ 套件的 `editor:core:test` 回归链可按需移植。
 5. tsc 基线 488（上游文件自身类型债），后续可在独立批次清理。
+
+## 8. 验收回归：E-01 missing-original-bounds 排查（2026-10-28）
+
+**现象**：用户验收（生产构建）编辑第 1 页文本后下载，报 `[E-01] Core export failed at eligibility: missing-original-bounds`。
+
+**排查过程与结论**：
+
+1. 用户原件 `2026年广东省青少年游泳锦标赛竞赛规程.pdf` 与上游 fixture `gd-swim-2026.pdf` **字节一致**（sha1 83537a5d，13 页）——排除文件因素。
+2. 关键修复完整性核查：sidecar 增量并入 / pristine 快照 / precomputeSidecarOperatorProvenance / pageOneBasedOf / CTM 核验 / omittedWhitespaceUnits / groupKey / pageDisplacementDyOf / OCR bounds 注册等 **12 项标记全部在同步版本中**。
+3. 生产构建（`vite build` + `vite preview`）+ 用户真实路径（🎉 引导弹窗 → "Edit Text" 卡片）实测：
+   - p1 单处编辑 → 下载 ✅ CORE-EXPORT-PROD 296KB
+   - 多处编辑（中文 insertText + Backspace 删除 + 再编辑）→ 下载 ✅ 304KB
+   - p1 编辑 → 翻 p2 → 编辑 → 下载 ✅ 315KB（`[SIDECAR-APPEND] appendedLines: 22` + 重绘 members=5/displaced=9）
+   - 翻页往返 → 再编辑 → 下载 ✅ 301KB
+   - 全部场景 `[E-01]` 精确命中 = 0、pageErrors = 0。
+4. **结论：当前代码（a9f4b71）无法复现用户报错。** 用户报错 bundle（`index-PpN8MOl-.js`）已被后续构建覆盖，无法回验其代码版本；时间线指向用户验收时构建的是**方案 B 之前的旧编辑器**，其 missing-original-bounds 属上游 10-17~10-26 已修复的缺陷（方案 B 已同步全部修复）。
+5. **已交付的永久诊断**（commit a9f4b71）：sidecar 构建失败原为静默 `catch { sidecar = null }`，现显式输出 `[SIDECAR-BUILD-FAILED]` + `window.__planbSidecarError`；成功输出 `[SIDECAR-BUILT]` 概况 + `window.__bindingSidecar` 探针。E-01 复现时可立即归因。
+
+**教训**：console 断言正则 `/E-01/i` 会误匹配 `[CORE-012A]` / `[CORE-012C6]` 前缀中的 "E-01" 子串（"COR**E-01**2A"）——日志断言必须用 `/\[E-01\]/` 精确匹配。
+
+**遗留**：`[ExportRenderer][CID] fallback:NotoSansSC 字体创建失败 Error: Unknown font format`——同步进来的 `NotoSansSC-Regular.otf`（8.33MB）在 fontkit 解析失败，fallback 来源自动退出（导出不受影响，但影响生僻 CJK 的导出保真度），待单独排查。
+
+**测试资产**：`tests/e2e/f3b-planb-accept*.spec.ts`、`f3b-planb-e01-*.spec.ts`（本地，gitignored）。
