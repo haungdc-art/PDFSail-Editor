@@ -3384,7 +3384,24 @@ function PDFEditorInner({ pageChangeGuardRef }: { pageChangeGuardRef: React.Muta
         decision.origin === "ocr"
           ? buildBindingSidecarFromOcr(legacyDoc, sidecarGenerationRef.current)
           : buildBindingSidecarFromPdfNative(legacyDoc, sidecarGenerationRef.current, operatorProvenance);
-    } catch {
+      // [SIDECAR-DIAG] 构建概况 + 控制台只读探针（归因 E-01 用）
+      try {
+        const sc = bindingSidecarRef.current;
+        (window as any).__bindingSidecar = sc;
+        console.log("[SIDECAR-BUILT]", {
+          origin: sc?.origin,
+          generation: sc?.generation,
+          lines: Object.keys(sc?.lines ?? {}).length,
+          blocks: Object.keys(sc?.blocks ?? {}).length,
+          pages: legacyDoc.pages.length,
+        });
+      } catch {}
+    } catch (e) {
+      // ★ 2026-10-28（用户验收「E-01 missing-original-bounds」）：构建失败此前**静默置 null**
+      //   ⇒ 编辑不受影响（不读 sidecar）⇒ 导出 eligibility 时所有被编辑 run 查不到
+      //   originalBounds ⇒ E-01。静默失败使该链路完全不可归因 ⇒ 显式暴露。
+      console.error("[SIDECAR-BUILD-FAILED] sidecar 构建异常（fail-open 置 null；导出将被 E-01 拒绝）:", e);
+      (window as any).__planbSidecarError = String(e);
       bindingSidecarRef.current = null;
     }
   }, [editableDocVersion]);
